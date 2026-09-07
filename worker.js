@@ -39,21 +39,32 @@ export default {
     const proxyHeaders = new Headers();
     proxyHeaders.set("Referer", referer);
     proxyHeaders.set("User-Agent", userAgent);
-    proxyHeaders.set("Connection", "keep-alive"); // إجبار السيرفر على عدم قطع الاتصال
+    proxyHeaders.set("Connection", "keep-alive");
 
     const range = request.headers.get("Range");
     if (range) proxyHeaders.set("Range", range);
 
     try {
-      const response = await fetch(targetUrl, { method: "GET", headers: proxyHeaders, redirect: "follow" });
-      const newHeaders = new Headers(response.headers);
+      const response = await fetch(targetUrl, { 
+        method: "GET", 
+        headers: proxyHeaders, 
+        redirect: "follow"
+      });
       
+      const newHeaders = new Headers(response.headers);
       newHeaders.set("Access-Control-Allow-Origin", "*");
-      // حذف طول المحتوى ليتم تدفق الفيديو بحرية تامة دون قيود
       newHeaders.delete("Content-Length"); 
 
       if (targetUrl.includes('.m3u8')) {
         newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
+        
+        // ==========================================
+        // مانع الكاش (السر في استمرار البث المباشر)
+        // ==========================================
+        newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+        newHeaders.set("Pragma", "no-cache");
+        newHeaders.set("Expires", "0");
+        
         let text = await response.text();
         const baseUrl = new URL(targetUrl);
         const workerBase = `${url.origin}${url.pathname}?ref=${encodeURIComponent(referer)}&ua=${encodeURIComponent(userAgent)}&url=`;
@@ -74,8 +85,9 @@ export default {
 
         return new Response(text, { status: response.status, headers: newHeaders });
       } else {
-        // أي جزء لا يحتوي على m3u8 نعتبره فوراً فيديو لضمان عمل كافة الامتدادات المموهة
+        // أجزاء الفيديو (مسموح لها بالكاش لتخفيف الضغط)
         newHeaders.set("Content-Type", "video/mp2t");
+        newHeaders.set("Cache-Control", "public, max-age=3600");
         return new Response(response.body, { status: response.status, headers: newHeaders });
       }
     } catch (e) {
