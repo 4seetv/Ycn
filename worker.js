@@ -18,7 +18,8 @@ export default {
     if (apiTarget) {
       try {
         const apiResponse = await fetch(apiTarget, {
-          headers: { "User-Agent": "okhttp/4.12.0", "Accept": "application/json" }
+          headers: { "User-Agent": "okhttp/4.12.0", "Accept": "application/json" },
+          cf: { cacheTtl: 0 } // منع كلاود فلير من تخزين الرد
         });
         const newHeaders = new Headers(apiResponse.headers);
         newHeaders.set("Access-Control-Allow-Origin", "*");
@@ -39,16 +40,15 @@ export default {
     const proxyHeaders = new Headers();
     proxyHeaders.set("Referer", referer);
     proxyHeaders.set("User-Agent", userAgent);
-    proxyHeaders.set("Connection", "keep-alive");
-
-    const range = request.headers.get("Range");
-    if (range) proxyHeaders.set("Range", range);
 
     try {
+      // إجبار كلاود فلير على جلب نسخة جديدة من السيرفر دائماً
       const response = await fetch(targetUrl, { 
         method: "GET", 
         headers: proxyHeaders, 
-        redirect: "follow"
+        redirect: "follow",
+        cache: "no-store",
+        cf: { cacheTtl: 0 } 
       });
       
       const newHeaders = new Headers(response.headers);
@@ -57,10 +57,6 @@ export default {
 
       if (targetUrl.includes('.m3u8')) {
         newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
-        
-        // ==========================================
-        // مانع الكاش (السر في استمرار البث المباشر)
-        // ==========================================
         newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
         newHeaders.set("Pragma", "no-cache");
         newHeaders.set("Expires", "0");
@@ -78,15 +74,21 @@ export default {
             });
           } else if (line && !line.startsWith('#')) {
             const absoluteUrl = new URL(line, baseUrl).href;
-            return `${workerBase}${encodeURIComponent(absoluteUrl)}`;
+            let finalUrl = `${workerBase}${encodeURIComponent(absoluteUrl)}`;
+            
+            // [السر هنا]: إضافة طابع زمني عشوائي للقوائم الفرعية لمنع الكاش نهائياً
+            if (absoluteUrl.includes('.m3u8')) {
+              finalUrl += `&cb=${Date.now()}${Math.floor(Math.random() * 1000)}`;
+            }
+            return finalUrl;
           }
           return line;
         }).join('\n');
 
         return new Response(text, { status: response.status, headers: newHeaders });
       } else {
-        // أجزاء الفيديو (مسموح لها بالكاش لتخفيف الضغط)
         newHeaders.set("Content-Type", "video/mp2t");
+        // السماح بتخزين أجزاء الفيديو فقط لتخفيف الضغط وتقليل التقطيع
         newHeaders.set("Cache-Control", "public, max-age=3600");
         return new Response(response.body, { status: response.status, headers: newHeaders });
       }
