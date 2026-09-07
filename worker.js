@@ -5,7 +5,7 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Range, User-Agent, Accept, t",
+          "Access-Control-Allow-Headers": "*",
           "Access-Control-Max-Age": "86400",
         },
       });
@@ -13,65 +13,47 @@ export default {
 
     const url = new URL(request.url);
 
-    // ==========================================
-    // الميزة الجديدة: تمرير طلبات الـ API عبر الكلاود فلير لحل مشكلة الـ IP
-    // ==========================================
+    // 1. وسيط الـ API
     const apiTarget = url.searchParams.get('api_target');
     if (apiTarget) {
       try {
         const apiResponse = await fetch(apiTarget, {
-          headers: {
-            "User-Agent": "okhttp/4.12.0",
-            "Accept": "application/json"
-          }
+          headers: { "User-Agent": "okhttp/4.12.0", "Accept": "application/json" }
         });
-        
         const newHeaders = new Headers(apiResponse.headers);
         newHeaders.set("Access-Control-Allow-Origin", "*");
-        newHeaders.set("Access-Control-Expose-Headers", "t"); // مهم جداً لفك التشفير في الفلاسك
-        
+        newHeaders.set("Access-Control-Expose-Headers", "t");
         return new Response(apiResponse.body, { status: apiResponse.status, headers: newHeaders });
       } catch (e) {
         return new Response("API Proxy Error", { status: 500 });
       }
     }
 
-    // ==========================================
-    // تشغيل البث (الكود السابق)
-    // ==========================================
+    // 2. وسيط البث
     const targetUrl = url.searchParams.get('url');
     const referer = url.searchParams.get('ref') || "https://x.com/";
     const userAgent = url.searchParams.get('ua') || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
 
-    if (!targetUrl) {
-      return new Response("Missing url parameter", { status: 400 });
-    }
+    if (!targetUrl) return new Response("Missing url", { status: 400 });
 
     const proxyHeaders = new Headers();
     proxyHeaders.set("Referer", referer);
     proxyHeaders.set("User-Agent", userAgent);
-    
+    proxyHeaders.set("Connection", "keep-alive"); // إجبار السيرفر على عدم قطع الاتصال
+
     const range = request.headers.get("Range");
-    if (range) {
-      proxyHeaders.set("Range", range);
-    }
+    if (range) proxyHeaders.set("Range", range);
 
     try {
-      const response = await fetch(targetUrl, {
-        method: "GET",
-        headers: proxyHeaders,
-        redirect: "follow"
-      });
-
+      const response = await fetch(targetUrl, { method: "GET", headers: proxyHeaders, redirect: "follow" });
       const newHeaders = new Headers(response.headers);
+      
       newHeaders.set("Access-Control-Allow-Origin", "*");
-      newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range");
+      // حذف طول المحتوى ليتم تدفق الفيديو بحرية تامة دون قيود
+      newHeaders.delete("Content-Length"); 
 
-      if (targetUrl.includes('.pdf') || targetUrl.includes('.js') || targetUrl.includes('.ts')) {
-        newHeaders.set("Content-Type", "video/mp2t");
-      } else if (targetUrl.includes('.m3u8')) {
+      if (targetUrl.includes('.m3u8')) {
         newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
-        
         let text = await response.text();
         const baseUrl = new URL(targetUrl);
         const workerBase = `${url.origin}${url.pathname}?ref=${encodeURIComponent(referer)}&ua=${encodeURIComponent(userAgent)}&url=`;
@@ -91,12 +73,13 @@ export default {
         }).join('\n');
 
         return new Response(text, { status: response.status, headers: newHeaders });
+      } else {
+        // أي جزء لا يحتوي على m3u8 نعتبره فوراً فيديو لضمان عمل كافة الامتدادات المموهة
+        newHeaders.set("Content-Type", "video/mp2t");
+        return new Response(response.body, { status: response.status, headers: newHeaders });
       }
-
-      return new Response(response.body, { status: response.status, headers: newHeaders });
-      
     } catch (e) {
-      return new Response(`Worker Proxy Error: ${e.message}`, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
+      return new Response(`Worker Error: ${e.message}`, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
     }
   }
 }
