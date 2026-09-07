@@ -13,20 +13,19 @@ export default {
 
     const url = new URL(request.url);
 
-    // 1. وسيط الـ API (تم إصلاح الانهيار هنا)
+    // 1. وسيط الـ API (نظيف وبدون إضافات تسبب كراش)
     const apiTarget = url.searchParams.get('api_target');
     if (apiTarget) {
       try {
         const apiResponse = await fetch(apiTarget, {
-          headers: { "User-Agent": "okhttp/4.12.0", "Accept": "application/json" },
-          cache: "no-store" // الطريقة الآمنة لمنع كاش الـ API
+          headers: { "User-Agent": "okhttp/4.12.0", "Accept": "application/json" }
         });
         const newHeaders = new Headers(apiResponse.headers);
         newHeaders.set("Access-Control-Allow-Origin", "*");
         newHeaders.set("Access-Control-Expose-Headers", "t");
         return new Response(apiResponse.body, { status: apiResponse.status, headers: newHeaders });
       } catch (e) {
-        return new Response("API Proxy Error", { status: 500 });
+        return new Response("API Proxy Error: " + e.message, { status: 500 });
       }
     }
 
@@ -35,26 +34,18 @@ export default {
     const referer = url.searchParams.get('ref') || "https://x.com/";
     const userAgent = url.searchParams.get('ua') || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
 
-    if (!targetUrl) return new Response("Missing url", { status: 400 });
+    if (!targetUrl) return new Response("Missing url parameter", { status: 400 });
 
     const proxyHeaders = new Headers();
     proxyHeaders.set("Referer", referer);
     proxyHeaders.set("User-Agent", userAgent);
 
-    // إعدادات جلب البيانات
-    const fetchOptions = {
-      method: "GET",
-      headers: proxyHeaders,
-      redirect: "follow"
-    };
-
-    // منع كلاود فلير من تخزين قوائم الـ m3u8 بأمان
-    if (targetUrl.includes('.m3u8')) {
-      fetchOptions.cache = "no-store";
-    }
-
     try {
-      const response = await fetch(targetUrl, fetchOptions);
+      const response = await fetch(targetUrl, { 
+        method: "GET", 
+        headers: proxyHeaders, 
+        redirect: "follow" 
+      });
       
       const newHeaders = new Headers(response.headers);
       newHeaders.set("Access-Control-Allow-Origin", "*");
@@ -63,7 +54,7 @@ export default {
       if (targetUrl.includes('.m3u8')) {
         newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
         
-        // إجبار متصفح المستخدم على عدم حفظ الكاش
+        // منع المتصفح من كاش الـ M3U8
         newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
         newHeaders.set("Pragma", "no-cache");
         newHeaders.set("Expires", "0");
@@ -81,7 +72,13 @@ export default {
             });
           } else if (line && !line.startsWith('#')) {
             const absoluteUrl = new URL(line, baseUrl).href;
-            return `${workerBase}${encodeURIComponent(absoluteUrl)}`;
+            let finalUrl = `${workerBase}${encodeURIComponent(absoluteUrl)}`;
+            
+            // إضافة رقم عشوائي لتدمير الكاش (هنا يكمن الحل السحري لتقطيع الـ 20 ثانية)
+            if (absoluteUrl.includes('.m3u8')) {
+              finalUrl += `&cb=${Date.now()}${Math.floor(Math.random() * 1000)}`;
+            }
+            return finalUrl;
           }
           return line;
         }).join('\n');
@@ -93,7 +90,7 @@ export default {
         return new Response(response.body, { status: response.status, headers: newHeaders });
       }
     } catch (e) {
-      return new Response(`Worker Error: ${e.message}`, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
+      return new Response(`Worker Proxy Error: ${e.message}`, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
     }
   }
 }
