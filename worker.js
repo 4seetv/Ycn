@@ -13,13 +13,13 @@ export default {
 
     const url = new URL(request.url);
 
-    // 1. وسيط الـ API
+    // 1. وسيط الـ API (تم إصلاح الانهيار هنا)
     const apiTarget = url.searchParams.get('api_target');
     if (apiTarget) {
       try {
         const apiResponse = await fetch(apiTarget, {
           headers: { "User-Agent": "okhttp/4.12.0", "Accept": "application/json" },
-          cf: { cacheTtl: 0 } // منع كلاود فلير من تخزين الرد
+          cache: "no-store" // الطريقة الآمنة لمنع كاش الـ API
         });
         const newHeaders = new Headers(apiResponse.headers);
         newHeaders.set("Access-Control-Allow-Origin", "*");
@@ -41,15 +41,20 @@ export default {
     proxyHeaders.set("Referer", referer);
     proxyHeaders.set("User-Agent", userAgent);
 
+    // إعدادات جلب البيانات
+    const fetchOptions = {
+      method: "GET",
+      headers: proxyHeaders,
+      redirect: "follow"
+    };
+
+    // منع كلاود فلير من تخزين قوائم الـ m3u8 بأمان
+    if (targetUrl.includes('.m3u8')) {
+      fetchOptions.cache = "no-store";
+    }
+
     try {
-      // إجبار كلاود فلير على جلب نسخة جديدة من السيرفر دائماً
-      const response = await fetch(targetUrl, { 
-        method: "GET", 
-        headers: proxyHeaders, 
-        redirect: "follow",
-        cache: "no-store",
-        cf: { cacheTtl: 0 } 
-      });
+      const response = await fetch(targetUrl, fetchOptions);
       
       const newHeaders = new Headers(response.headers);
       newHeaders.set("Access-Control-Allow-Origin", "*");
@@ -57,6 +62,8 @@ export default {
 
       if (targetUrl.includes('.m3u8')) {
         newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
+        
+        // إجبار متصفح المستخدم على عدم حفظ الكاش
         newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
         newHeaders.set("Pragma", "no-cache");
         newHeaders.set("Expires", "0");
@@ -74,13 +81,7 @@ export default {
             });
           } else if (line && !line.startsWith('#')) {
             const absoluteUrl = new URL(line, baseUrl).href;
-            let finalUrl = `${workerBase}${encodeURIComponent(absoluteUrl)}`;
-            
-            // [السر هنا]: إضافة طابع زمني عشوائي للقوائم الفرعية لمنع الكاش نهائياً
-            if (absoluteUrl.includes('.m3u8')) {
-              finalUrl += `&cb=${Date.now()}${Math.floor(Math.random() * 1000)}`;
-            }
-            return finalUrl;
+            return `${workerBase}${encodeURIComponent(absoluteUrl)}`;
           }
           return line;
         }).join('\n');
@@ -88,7 +89,6 @@ export default {
         return new Response(text, { status: response.status, headers: newHeaders });
       } else {
         newHeaders.set("Content-Type", "video/mp2t");
-        // السماح بتخزين أجزاء الفيديو فقط لتخفيف الضغط وتقليل التقطيع
         newHeaders.set("Cache-Control", "public, max-age=3600");
         return new Response(response.body, { status: response.status, headers: newHeaders });
       }
