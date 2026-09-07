@@ -5,15 +5,41 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Range, User-Agent, Accept",
+          "Access-Control-Allow-Headers": "Content-Type, Range, User-Agent, Accept, t",
           "Access-Control-Max-Age": "86400",
         },
       });
     }
 
     const url = new URL(request.url);
+
+    // ==========================================
+    // الميزة الجديدة: تمرير طلبات الـ API عبر الكلاود فلير لحل مشكلة الـ IP
+    // ==========================================
+    const apiTarget = url.searchParams.get('api_target');
+    if (apiTarget) {
+      try {
+        const apiResponse = await fetch(apiTarget, {
+          headers: {
+            "User-Agent": "okhttp/4.12.0",
+            "Accept": "application/json"
+          }
+        });
+        
+        const newHeaders = new Headers(apiResponse.headers);
+        newHeaders.set("Access-Control-Allow-Origin", "*");
+        newHeaders.set("Access-Control-Expose-Headers", "t"); // مهم جداً لفك التشفير في الفلاسك
+        
+        return new Response(apiResponse.body, { status: apiResponse.status, headers: newHeaders });
+      } catch (e) {
+        return new Response("API Proxy Error", { status: 500 });
+      }
+    }
+
+    // ==========================================
+    // تشغيل البث (الكود السابق)
+    // ==========================================
     const targetUrl = url.searchParams.get('url');
-    // استقبال الـ Referer والـ User-Agent من الفلاسك، أو استخدام قيم افتراضية
     const referer = url.searchParams.get('ref') || "https://x.com/";
     const userAgent = url.searchParams.get('ua') || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
 
@@ -48,8 +74,6 @@ export default {
         
         let text = await response.text();
         const baseUrl = new URL(targetUrl);
-        
-        // بناء رابط الوسيط الجديد ليحمل نفس الـ Referer والـ User-Agent للأجزاء القادمة
         const workerBase = `${url.origin}${url.pathname}?ref=${encodeURIComponent(referer)}&ua=${encodeURIComponent(userAgent)}&url=`;
 
         text = text.split('\n').map(line => {
