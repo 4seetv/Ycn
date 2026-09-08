@@ -12,9 +12,8 @@ export default {
     }
 
     const url = new URL(request.url);
-
-    // 1. وسيط الـ API (يعمل بثبات لسحب رابط البث بدون مشاكل IP)
     const apiTarget = url.searchParams.get('api_target');
+    
     if (apiTarget) {
       try {
         const apiResponse = await fetch(apiTarget, {
@@ -29,7 +28,6 @@ export default {
       }
     }
 
-    // 2. وسيط البث
     const targetUrl = url.searchParams.get('url');
     const referer = url.searchParams.get('ref') || "https://x.com/";
     const userAgent = url.searchParams.get('ua') || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
@@ -54,8 +52,6 @@ export default {
 
       if (targetUrl.includes('.m3u8')) {
         newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
-        
-        // الحل السليم لمشكلة تقطيع الـ 20 ثانية (إخبار المتصفح بعدم الحفظ)
         newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
         newHeaders.set("Pragma", "no-cache");
         newHeaders.set("Expires", "0");
@@ -72,7 +68,10 @@ export default {
               return `URI="${workerBase}${encodeURIComponent(absoluteUrl)}"`;
             });
           } else if (line && !line.startsWith('#')) {
+            // [الحل الجذري]: بناء الرابط المطلق بذكاء لضمان عدم ضياع أي توكن
             const absoluteUrl = new URL(line, baseUrl).href;
+            
+            // تمرير الرابط للـ Proxy مع الحفاظ على كل مكوناته
             return `${workerBase}${encodeURIComponent(absoluteUrl)}`;
           }
           return line;
