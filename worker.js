@@ -32,16 +32,14 @@ async function fetchAndDecrypt(endpoint) {
 
     const dynamicKey = STATIC_SECRET + tHeader;
     let encryptedBase64 = await response.text();
-    encryptedBase64 = encryptedBase64.trim().replace(/\s/g, ''); // تنظيف النص
+    encryptedBase64 = encryptedBase64.trim().replace(/\s/g, ''); 
 
-    // 1. Base64 Decode
     const rawString = atob(encryptedBase64);
     const rawBytes = new Uint8Array(rawString.length);
     for (let i = 0; i < rawString.length; i++) {
         rawBytes[i] = rawString.charCodeAt(i);
     }
 
-    // 2. XOR Decryption
     const encoder = new TextEncoder();
     const keyBytes = encoder.encode(dynamicKey);
     const decryptedBytes = new Uint8Array(rawBytes.length);
@@ -50,7 +48,6 @@ async function fetchAndDecrypt(endpoint) {
         decryptedBytes[i] = rawBytes[i] ^ keyBytes[i % keyBytes.length];
     }
 
-    // 3. Parse JSON
     const decoder = new TextDecoder("utf-8");
     const jsonString = decoder.decode(decryptedBytes);
     return JSON.parse(jsonString);
@@ -65,7 +62,6 @@ function rewriteM3u8(manifest, baseUrl, workerOrigin) {
         const trimmed = line.trim();
         if (!trimmed) return "";
 
-        // اعتراض مفتاح التشفير (DRM / AES-128 KEY)
         if (trimmed.startsWith('#EXT-X-KEY')) {
             return trimmed.replace(/URI="(.*?)"/, (match, uri) => {
                 const absUrl = new URL(uri, baseUrl).href;
@@ -73,7 +69,6 @@ function rewriteM3u8(manifest, baseUrl, workerOrigin) {
                 return `URI="${workerOrigin}/proxy?u=${encodedUrl}&type=key"`;
             });
         } 
-        // تمرير الروابط العادية (ملفات ts أو قوائم أخرى)
         else if (trimmed.startsWith('#') && trimmed.includes('URI=')) {
             return trimmed.replace(/URI="(.*?)"/, (match, uri) => {
                 const absUrl = new URL(uri, baseUrl).href;
@@ -82,7 +77,6 @@ function rewriteM3u8(manifest, baseUrl, workerOrigin) {
             });
         } 
         else if (!trimmed.startsWith('#')) {
-            // مقاطع الفيديو الوهمية (segments)
             const absUrl = new URL(trimmed, baseUrl).href;
             const encodedUrl = btoa(absUrl);
             return `${workerOrigin}/proxy?u=${encodedUrl}&type=ts`;
@@ -107,6 +101,7 @@ export default {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Range, Accept",
+            "Content-Type": "application/json;charset=UTF-8"
         };
 
         if (request.method === "OPTIONS") {
@@ -115,14 +110,31 @@ export default {
 
         try {
             // -------------------------------------------------------------------
-            // 1. مسار التشغيل المباشر: /play/{channel_id}
+            // 1. جلب الأقسام (Categories)
+            // -------------------------------------------------------------------
+            if (path === "/categories") {
+                const apiData = await fetchAndDecrypt("/categories");
+                return new Response(JSON.stringify(apiData, null, 2), { status: 200, headers: corsHeaders });
+            }
+
+            // -------------------------------------------------------------------
+            // 2. جلب القنوات داخل قسم معين (Channels in Category)
+            // مثال: /categories/12/channels
+            // -------------------------------------------------------------------
+            if (path.startsWith("/categories/") && path.endsWith("/channels")) {
+                const categoryId = path.split("/")[2];
+                const apiData = await fetchAndDecrypt(`/categories/${categoryId}/channels`);
+                return new Response(JSON.stringify(apiData, null, 2), { status: 200, headers: corsHeaders });
+            }
+
+            // -------------------------------------------------------------------
+            // 3. مسار التشغيل المباشر: /play/{channel_id}
             // -------------------------------------------------------------------
             if (path.startsWith("/play/")) {
                 const channelId = path.split("/")[2];
                 const isRawRequested = url.searchParams.get("raw") === "1";
                 const acceptHeader = request.headers.get("Accept") || "";
 
-                // مشغل ويب في حال فتح الرابط عبر المتصفح
                 if (!isRawRequested && acceptHeader.includes("text/html")) {
                     const streamUrl = `${workerOrigin}/play/${channelId}?raw=1`;
                     const html = `<!DOCTYPE html>
@@ -148,29 +160,27 @@ export default {
                       }
                     </script>
                     </body></html>`;
-                    return new Response(html, { headers: { "Content-Type": "text/html;charset=UTF-8", ...corsHeaders }});
+                    return new Response(html, { headers: { "Content-Type": "text/html;charset=UTF-8", "Access-Control-Allow-Origin": "*" }});
                 }
 
-                // الاتصال بـ API وفك التشفير وجلب الرابط
                 const apiData = await fetchAndDecrypt(`/channel/${channelId}`);
                 if (!apiData.data || !apiData.data[0] || !apiData.data[0].url) {
                     throw new Error("Invalid Decrypted Payload: Missing URL");
                 }
                 const streamUrl = apiData.data[0].url;
 
-                // جلب الماستر بلاي ليست وإعادة كتابتها ليقرأها المشغل مباشرة كملف M3U8 طبيعي
                 const m3u8Req = await fetch(streamUrl, { headers: UPSTREAM_HEADERS });
                 const manifest = await m3u8Req.text();
                 const rewritten = rewriteM3u8(manifest, m3u8Req.url, workerOrigin);
 
                 return new Response(rewritten, {
                     status: 200,
-                    headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }
+                    headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/vnd.apple.mpegurl" }
                 });
             }
 
             // -------------------------------------------------------------------
-            // 2. البروكسي (معالجة المقاطع والمفاتيح الوهمية)
+            // 4. البروكسي (معالجة المقاطع والمفاتيح الوهمية)
             // -------------------------------------------------------------------
             if (path === "/proxy") {
                 const targetB64 = url.searchParams.get("u");
@@ -179,7 +189,6 @@ export default {
                 if (!targetB64) return new Response("Missing URL", { status: 400 });
                 const targetUrl = atob(targetB64);
 
-                // إجبار تمرير ترويسات الحماية (Rule 1)
                 const fetchHeaders = new Headers(UPSTREAM_HEADERS);
                 if (request.headers.has("Range")) {
                     fetchHeaders.set("Range", request.headers.get("Range"));
@@ -191,43 +200,47 @@ export default {
                     redirect: "follow"
                 });
 
-                // معالجة القوائم الفرعية
                 if (type === 'm3u8') {
                     const manifest = await response.text();
                     const rewritten = rewriteM3u8(manifest, response.url, workerOrigin);
                     return new Response(rewritten, {
                         status: 200,
-                        headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }
+                        headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/vnd.apple.mpegurl" }
                     });
                 }
 
                 const newHeaders = new Headers(response.headers);
                 newHeaders.set("Access-Control-Allow-Origin", "*");
-                
-                // تنظيف الترويسات التي تعيق تدفق الفيديو (Rule 4)
                 newHeaders.delete("content-encoding");
                 newHeaders.delete("transfer-encoding");
 
-                // تصحيح نوع الملف (MIME Type Spoofing Correction - Rule 3 & 2)
                 if (type === 'ts') {
                     newHeaders.set("Content-Type", "video/mp2t");
                 } else if (type === 'key') {
                     newHeaders.set("Content-Type", "application/octet-stream");
                 }
 
-                // تمرير المقطع فوراً كـ Stream دون تحميله بالكامل
                 return new Response(response.body, {
                     status: response.status,
                     headers: newHeaders
                 });
             }
 
-            return new Response("YCN IPTV Middleware is Online.", { status: 200 });
+            // مسار رئيسي كدليل استخدام
+            const info = {
+                "message": "YCN IPTV Middleware is Online",
+                "routes": {
+                    "categories": "/categories",
+                    "channels_in_category": "/categories/{id}/channels",
+                    "play_channel": "/play/{id}"
+                }
+            };
+            return new Response(JSON.stringify(info, null, 2), { status: 200, headers: corsHeaders });
 
         } catch (error) {
             return new Response(JSON.stringify({ error: error.message }), { 
                 status: 500, 
-                headers: { ...corsHeaders, "Content-Type": "application/json" }
+                headers: corsHeaders 
             });
         }
     }
