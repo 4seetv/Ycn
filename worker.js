@@ -31,13 +31,10 @@ async function getCryptoKey() {
     );
 }
 
-// أدوات مساعدة للتعامل مع Base64
 function arrayBufferToBase64(buffer) {
     let binary = '';
     let bytes = new Uint8Array(buffer);
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
     return btoa(binary);
 }
 
@@ -45,9 +42,7 @@ function base64ToArrayBuffer(base64) {
     let binary_string = atob(base64);
     let len = binary_string.length;
     let bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binary_string.charCodeAt(i);
-    }
+    for (let i = 0; i < len; i++) bytes[i] = binary_string.charCodeAt(i);
     return bytes;
 }
 
@@ -55,13 +50,7 @@ async function encryptPayload(jsonData) {
     const key = await getCryptoKey();
     const iv = encoder.encode(AES_IV_STRING);
     const data = encoder.encode(JSON.stringify(jsonData));
-
-    const encryptedBuffer = await crypto.subtle.encrypt(
-        { name: "AES-CBC", iv: iv },
-        key,
-        data
-    );
-
+    const encryptedBuffer = await crypto.subtle.encrypt({ name: "AES-CBC", iv: iv }, key, data);
     return arrayBufferToBase64(encryptedBuffer) + ':' + IV_BASE64;
 }
 
@@ -70,18 +59,12 @@ async function decryptPayload(encryptedText) {
     const key = await getCryptoKey();
     const iv = encoder.encode(AES_IV_STRING);
     const bytes = base64ToArrayBuffer(ciphertextBase64);
-
-    const decryptedBuffer = await crypto.subtle.decrypt(
-        { name: "AES-CBC", iv: iv },
-        key,
-        bytes
-    );
-
+    const decryptedBuffer = await crypto.subtle.decrypt({ name: "AES-CBC", iv: iv }, key, bytes);
     return JSON.parse(decoder.decode(decryptedBuffer));
 }
 
 // ==========================================
-// بناء الطلبات وتخطي الحماية
+// بناء الطلبات
 // ==========================================
 function commonPayload() {
     return {
@@ -105,25 +88,21 @@ function commonPayload() {
 
 async function encryptedPost(url, data) {
     const body = await encryptPayload(data);
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: API_HEADERS,
-        body: body
-    });
+    const response = await fetch(url, { method: 'POST', headers: API_HEADERS, body: body });
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
     const text = await response.text();
     return await decryptPayload(text);
 }
 
 // ==========================================
-// دوال جلب السيرفرات والتوجيه (Resolver)
+// جلب وحل السيرفرات
 // ==========================================
 async function resolveChannel(channelId, serverIndex = 0) {
     const payload = commonPayload();
     payload.id = channelId;
     const streamInfo = await encryptedPost(`${LIVE_API_BASE}/getLiveAllStreamsById`, payload);
     const live = streamInfo.live;
-    if (!live) throw new Error("لم يتم العثور على معلومات القناة");
+    if (!live) throw new Error("القناة غير موجودة");
 
     let options = [];
     if (live.url) options.push({ url: live.url, agent: live.agent || "redirect" });
@@ -132,51 +111,37 @@ async function resolveChannel(channelId, serverIndex = 0) {
         let backups = Array.isArray(live.backup) ? live.backup : live.backup.split("-;-");
         backups.forEach(b => {
             let parts = b.split(" -- ");
-            let src = parts[0].trim();
-            let ag = parts[1] ? parts[1].trim() : "redirect";
-            options.push({ url: src, agent: ag });
+            options.push({ url: parts[0].trim(), agent: parts[1] ? parts[1].trim() : "redirect" });
         });
     }
 
-    if (serverIndex >= options.length) throw new Error("رقم السيرفر غير موجود");
+    if (serverIndex >= options.length) throw new Error("السيرفر غير متوفر");
     let selected = options[serverIndex];
     let source = selected.url;
     let resolverAgent = selected.agent;
-
     let resolved = { url: source, agent: "", headers: {}, swap: {} };
 
     if (["redirect", "double_redirect", "all_streams_redirect"].includes(resolverAgent)) {
         let rPayload = commonPayload();
-        rPayload.id = channelId;
-        rPayload.url = source;
-        rPayload.agent = resolverAgent;
-        
+        rPayload.id = channelId; rPayload.url = source; rPayload.agent = resolverAgent;
         let rData = await encryptedPost(`${REDIRECT_API_BASE}/getLiveByRedirect`, rPayload);
+        
         let nested = rData.data?.url || {};
-        if (typeof nested === 'string') {
-            try { nested = JSON.parse(nested); } catch (e) { nested = { url: nested }; }
-        }
+        if (typeof nested === 'string') { try { nested = JSON.parse(nested); } catch(e) { nested = {url: nested}; } }
         
         let nextUrl = nested.url;
         let nextAgent = nested.agent || rData.data?.agent || "redirect";
 
         if (resolverAgent === "double_redirect" && nextUrl) {
             let rPayload2 = commonPayload();
-            rPayload2.id = channelId;
-            rPayload2.url = nextUrl;
-            rPayload2.agent = nextAgent;
+            rPayload2.id = channelId; rPayload2.url = nextUrl; rPayload2.agent = nextAgent;
             try {
                 let rData2 = await encryptedPost(`${REDIRECT_API_BASE}/getLiveByRedirect`, rPayload2);
                 let nested2 = rData2.data?.url || {};
-                if (typeof nested2 === 'string') {
-                    try { nested2 = JSON.parse(nested2); } catch (e) { nested2 = { url: nested2 }; }
-                }
-                if (nested2.url) {
-                    nested = nested2;
-                }
-            } catch (e) {}
+                if (typeof nested2 === 'string') { try { nested2 = JSON.parse(nested2); } catch(e) { nested2 = {url: nested2}; } }
+                if (nested2.url) nested = nested2;
+            } catch(e) {}
         }
-
         resolved.url = nested.url || resolved.url;
         resolved.agent = nested.agent || "";
         resolved.headers = nested.headers || {};
@@ -190,23 +155,20 @@ async function resolveChannel(channelId, serverIndex = 0) {
         } catch(e) {}
     }
 
-    if (!resolved.url.startsWith('http')) {
-        throw new Error("رابط وهمي أو مشفر، يجب التخطي");
-    }
-
+    if (!resolved.url.startsWith('http')) throw new Error("رابط وهمي مكسور");
     return resolved;
 }
 
 // ==========================================
-// دوال التشفير للروابط (Stateless Proxy Token)
+// التوكن وتعديل الروابط
 // ==========================================
-function encodeProxyToken(url, referer, userAgent, swap) {
-    const data = JSON.stringify({ u: url, r: referer, a: userAgent, s: swap });
-    return arrayBufferToBase64(encoder.encode(data));
+function encodeProxyToken(url, referer, userAgent, swap, type) {
+    const data = JSON.stringify({ u: url, r: referer || "", a: userAgent || "", s: swap || {}, t: type });
+    return btoa(unescape(encodeURIComponent(data)));
 }
 
 function decodeProxyToken(token) {
-    return JSON.parse(decoder.decode(base64ToArrayBuffer(token)));
+    return JSON.parse(decodeURIComponent(escape(atob(token))));
 }
 
 function applySwap(uri, swapConfig) {
@@ -219,8 +181,35 @@ function applySwap(uri, swapConfig) {
     return result;
 }
 
+function rewriteManifest(manifestText, baseUrl, referer, agent, swap, workerOrigin) {
+    let lines = manifestText.split('\n');
+    let out = [];
+    for (let line of lines) {
+        let trimmed = line.trim();
+        if (!trimmed) continue;
+        
+        if (trimmed.startsWith("#")) {
+            let replaced = trimmed.replace(/URI="(.*?)"/g, (match, uri) => {
+                let swappedUri = applySwap(uri, swap);
+                let absoluteUrl = new URL(swappedUri, baseUrl).href;
+                let isManifest = absoluteUrl.includes('.m3u8') || absoluteUrl.includes('.mpd');
+                let token = encodeProxyToken(absoluteUrl, referer, agent, swap, isManifest ? 'm' : 's');
+                return `URI="${workerOrigin}/proxy?t=${encodeURIComponent(token)}"`;
+            });
+            out.push(replaced);
+        } else {
+            let swappedUri = applySwap(trimmed, swap);
+            let absoluteUrl = new URL(swappedUri, baseUrl).href;
+            let isManifest = absoluteUrl.includes('.m3u8') || absoluteUrl.includes('.mpd');
+            let token = encodeProxyToken(absoluteUrl, referer, agent, swap, isManifest ? 'm' : 's');
+            out.push(`${workerOrigin}/proxy?t=${encodeURIComponent(token)}`);
+        }
+    }
+    return out.join('\n');
+}
+
 // ==========================================
-// هندسة الـ Worker الأساسية
+// معالج الطلبات (Cloudflare Worker)
 // ==========================================
 export default {
     async fetch(request, env, ctx) {
@@ -231,18 +220,50 @@ export default {
         const corsHeaders = {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Range",
+            "Access-Control-Allow-Headers": "Content-Type, Range, Accept",
         };
         if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
         try {
             // ----------------------------------------------------
-            // 1. المسار الأساسي لتشغيل القناة: /play/:channel_id
+            // 1. مسار التشغيل: /play/:channel_id
             // ----------------------------------------------------
             if (path.startsWith("/play/")) {
                 const channelId = path.split("/")[2];
+                const isRawRequested = url.searchParams.get("raw") === "1";
+                const acceptHeader = request.headers.get("Accept") || "";
+
+                // إذا كان الطلب من متصفح (يريد صفحة ويب)، ولم يطلب البث الخام (?raw=1)
+                if (!isRawRequested && acceptHeader.includes("text/html")) {
+                    const streamUrl = `${workerOrigin}/play/${channelId}?raw=1`;
+                    const html = `<!DOCTYPE html>
+                    <html lang="ar" dir="rtl"><head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <title>Enlil IPTV Web Player</title>
+                    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+                    <style>body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;} video{width:100%;height:100%;outline:none;}</style>
+                    </head><body>
+                    <video id="video" controls autoplay playsinline></video>
+                    <script>
+                      var video = document.getElementById('video');
+                      var hlsUrl = '${streamUrl}';
+                      if (Hls.isSupported()) {
+                        var hls = new Hls({maxMaxBufferLength: 30});
+                        hls.loadSource(hlsUrl);
+                        hls.attachMedia(video);
+                        hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play().catch(e=>{}); });
+                      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                        video.src = hlsUrl;
+                        video.addEventListener('loadedmetadata', function() { video.play().catch(e=>{}); });
+                      }
+                    </script>
+                    </body></html>`;
+                    return new Response(html, { headers: { "Content-Type": "text/html;charset=UTF-8", ...corsHeaders }});
+                }
+
+                // النظام القناص (Failover): يفحص السيرفرات ويجلب أول بث شغال مباشرة
                 let serverCount = 8; 
-                
                 for (let i = 0; i < serverCount; i++) {
                     try {
                         const info = await resolveChannel(channelId, i);
@@ -251,19 +272,33 @@ export default {
                         const userAgent = info.agent || "ExoPlayer/2.18.1 (Linux; Android 13) ExoPlayerLib/2.18.1";
                         const swap = info.swap || {};
 
-                        const token = encodeProxyToken(targetUrl, referer, userAgent, swap);
-                        const proxyUrl = `${workerOrigin}/proxy?t=${encodeURIComponent(token)}`;
+                        // اختبار جلب البث للتأكد أنه شغال فعلاً
+                        let fetchHeaders = new Headers({ "User-Agent": userAgent, "Referer": referer });
+                        let response = await fetch(targetUrl, { headers: fetchHeaders, redirect: "follow" });
                         
-                        return Response.redirect(proxyUrl, 302);
+                        if (response.ok) {
+                            let contentType = response.headers.get("content-type") || "";
+                            if (contentType.includes("mpegurl") || targetUrl.includes(".m3u8")) {
+                                let manifestText = await response.text();
+                                let rewritten = rewriteManifest(manifestText, response.url, referer, userAgent, swap, workerOrigin);
+                                return new Response(rewritten, {
+                                    status: 200,
+                                    headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }
+                                });
+                            } else {
+                                // بث مباشر بصيغة TS او MP4
+                                return Response.redirect(targetUrl, 302);
+                            }
+                        }
                     } catch (err) {
-                        continue; // فشل السيرفر، جرب الذي يليه
+                        continue; // سيرفر معطل، انتقل للذي يليه فوراً
                     }
                 }
-                return new Response("All servers failed or blocked.", { status: 502, headers: corsHeaders });
+                return new Response("عذراً، جميع السيرفرات معطلة حالياً.", { status: 502, headers: corsHeaders });
             }
 
             // ----------------------------------------------------
-            // 2. البروكسي لإعادة كتابة القوائم وتمرير الفيديو: /proxy
+            // 2. وكيل المقاطع (Segments Proxy)
             // ----------------------------------------------------
             if (path === "/proxy") {
                 const token = url.searchParams.get("t");
@@ -271,76 +306,31 @@ export default {
 
                 const proxyData = decodeProxyToken(token);
                 const targetUrl = proxyData.u;
+                const type = proxyData.t; // 'm' للقوائم, 's' للمقاطع
                 
                 const fetchHeaders = new Headers();
                 fetchHeaders.set("User-Agent", proxyData.a);
                 fetchHeaders.set("Referer", proxyData.r);
                 if (request.headers.has("Range")) fetchHeaders.set("Range", request.headers.get("Range"));
 
-                const response = await fetch(targetUrl, {
-                    method: request.method,
-                    headers: fetchHeaders,
-                    redirect: "follow"
-                });
+                const response = await fetch(targetUrl, { method: request.method, headers: fetchHeaders, redirect: "follow" });
 
-                const contentType = response.headers.get("content-type") || "";
-                const responseUrl = response.url; 
-
-                // إذا كان الملف عبارة عن قائمة تشغيل (HLS/DASH)، أعد كتابته
-                if (contentType.includes("mpegurl") || targetUrl.includes(".m3u8") || contentType.includes("dash+xml") || targetUrl.includes(".mpd")) {
+                if (type === 'm') {
                     let manifestText = await response.text();
-                    const baseUrl = new URL(".", responseUrl).href;
-
-                    if (manifestText.includes("#EXTM3U")) {
-                        let rewrittenManifest = manifestText.split('\n').map(line => {
-                            let trimmed = line.trim();
-                            if (!trimmed) return "";
-                            if (trimmed.startsWith("#")) {
-                                return trimmed.replace(/URI="(.*?)"/g, (match, uri) => {
-                                    let swappedUri = applySwap(uri, proxyData.s);
-                                    let absoluteUrl = new URL(swappedUri, baseUrl).href;
-                                    let newToken = encodeProxyToken(absoluteUrl, proxyData.r, proxyData.a, proxyData.s);
-                                    return `URI="${workerOrigin}/proxy?t=${encodeURIComponent(newToken)}"`;
-                                });
-                            }
-                            let swappedUri = applySwap(trimmed, proxyData.s);
-                            let absoluteUrl = new URL(swappedUri, baseUrl).href;
-                            let newToken = encodeProxyToken(absoluteUrl, proxyData.r, proxyData.a, proxyData.s);
-                            return `${workerOrigin}/proxy?t=${encodeURIComponent(newToken)}`;
-                        }).join('\n');
-
-                        return new Response(rewrittenManifest, {
-                            status: 200,
-                            headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }
-                        });
-                    } 
-                    else if (manifestText.includes("<MPD")) {
-                        let rewrittenManifest = manifestText.replace(/(BaseURL|media|initialization|sourceURL)=["'](.*?)["']/g, (match, attr, uri) => {
-                            if (!uri.startsWith("http")) uri = new URL(uri, baseUrl).href;
-                            let newToken = encodeProxyToken(uri, proxyData.r, proxyData.a, proxyData.s);
-                            return `${attr}="${workerOrigin}/proxy?t=${encodeURIComponent(newToken)}"`;
-                        });
-                        
-                        return new Response(rewrittenManifest, {
-                            status: 200,
-                            headers: { ...corsHeaders, "Content-Type": "application/dash+xml" }
-                        });
-                    }
+                    let rewritten = rewriteManifest(manifestText, response.url, proxyData.r, proxyData.a, proxyData.s, workerOrigin);
+                    return new Response(rewritten, { status: 200, headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }});
                 }
 
-                // تمرير المقطع المباشر للـ VLC أو المشغل
+                // للمقاطع (Segments): تمرير الفيديو مباشرة
                 const newHeaders = new Headers(response.headers);
                 newHeaders.set("Access-Control-Allow-Origin", "*");
                 newHeaders.delete("content-encoding");
                 newHeaders.delete("transfer-encoding");
 
-                return new Response(response.body, {
-                    status: response.status,
-                    headers: newHeaders
-                });
+                return new Response(response.body, { status: response.status, headers: newHeaders });
             }
 
-            return new Response("Drama Live Middleware Worker is Online.", { status: 200 });
+            return new Response("Enlil IPTV Server Running", { status: 200 });
 
         } catch (error) {
             return new Response(error.message, { status: 500, headers: corsHeaders });
