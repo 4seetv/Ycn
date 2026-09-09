@@ -1,29 +1,27 @@
 // ============================================================================
-// YCN LIVE STREAM GATEWAY
+// YCN 24/7 HLS GATEWAY
 // Cloudflare Worker - Single File
 //
-// VERSION 4.0
+// VERSION 5.0 - TIMELINE LOCK
 //
-// IMPORTANT:
-// - NO fetch() "cache" option anywhere
-// - NO cf.cacheTtl
-// - NO Cache API
-// - Compatible with old Cloudflare Worker runtimes
+// Fixes:
+// 1. Prevents switching between different live timelines
+//    e.g. 108xx/.pdf/4s <-> 72xx/.js/6s
 //
-// Features:
-// - Base64 + Dynamic XOR API decoding
-// - Categories
-// - Channels
-// - Stable /live/{id}.m3u8 URLs
-// - Fresh playback URL on every playlist refresh
-// - HLS master + media playlist rewriting
-// - AES-128 key proxy
-// - Relative URL fixing
-// - t/e propagation
-// - Automatic token refresh
-// - Automatic retry after 401/403
-// - Range requests
-// - .ts / .pdf / .js disguised segments
+// 2. Locks one HLS profile per channel session.
+//
+// 3. MEDIA-SEQUENCE is prevented from moving backwards.
+//
+// 4. Segment timeout/failure recovery:
+//    re-fetches the SAME locked playlist and searches for the same segment
+//    on another upstream host.
+//
+// 5. Fresh API playback URL is NOT requested on every playlist reload.
+//
+// 6. Token refresh only near real expiration or if root playlist fails.
+//
+// 7. No unsupported fetch({ cache: ... }) option.
+//
 // ============================================================================
 
 
@@ -42,12 +40,6 @@ const CONFIG = {
   API_USER_AGENT:
     "okhttp/4.12.0",
 
-  API_ACCEPT:
-    "application/json",
-
-  DEFAULT_CATEGORY_ID:
-    4,
-
   DEFAULT_REFERER:
     "https://x.com/",
 
@@ -56,8 +48,30 @@ const CONFIG = {
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/139.0.0.0 Safari/537.36",
 
+  DEFAULT_CATEGORY_ID:
+    4,
+
+  // Number of manifest samples used to avoid a rotating upstream timeline.
+  MANIFEST_SAMPLES:
+    3,
+
+  // When a segment host hangs, abort it before the player buffer is exhausted.
+  SEGMENT_TIMEOUT_MS:
+    5500,
+
+  MANIFEST_TIMEOUT_MS:
+    6000,
+
+  API_TIMEOUT_MS:
+    7000,
+
+  // Refresh hours-long token before it actually expires.
   TOKEN_REFRESH_MARGIN_SECONDS:
-    30,
+    120,
+
+  // Session state stored at Cloudflare edge.
+  SESSION_TTL_SECONDS:
+    21600,
 
   CORS_ORIGIN:
     "*"
@@ -76,7 +90,7 @@ export default {
 
       if (request.method === "OPTIONS") {
 
-        return addCors(
+        return cors(
           new Response(null, {
             status: 204
           })
@@ -89,8 +103,8 @@ export default {
         request.method !== "HEAD"
       ) {
 
-        return addCors(
-          jsonError(
+        return cors(
+          errorJson(
             "Method not allowed",
             405
           )
@@ -98,12 +112,12 @@ export default {
       }
 
 
-      const requestUrl =
+      const url =
         new URL(request.url);
 
 
       const path =
-        requestUrl.pathname
+        url.pathname
           .replace(/^\/+/, "")
           .replace(/\/+$/, "");
 
@@ -114,19 +128,16 @@ export default {
 
       if (!path) {
 
-        return addCors(
-          jsonResponse({
+        return cors(
+          json({
 
             ok: true,
 
             service:
-              "YCN Live Streaming Gateway",
+              "YCN 24/7 Timeline Lock Gateway",
 
             version:
-              "4.0",
-
-            default_category:
-              CONFIG.DEFAULT_CATEGORY_ID,
+              "5.0",
 
             routes: {
 
@@ -140,12 +151,8 @@ export default {
                 "/c/1424",
 
               live:
-                "/live/1424.m3u8",
-
-              numbered:
-                "/1"
+                "/live/1424.m3u8"
             }
-
           })
         );
       }
@@ -157,8 +164,21 @@ export default {
 
       if (path === "categories") {
 
-        return addCors(
-          await categoriesRoute()
+        const categories =
+          await getCategories();
+
+
+        return cors(
+          json({
+
+            ok: true,
+
+            count:
+              categories.length,
+
+            categories:
+              categories
+          })
         );
       }
 
@@ -167,29 +187,50 @@ export default {
       // CATEGORY
       // ======================================================================
 
-      if (path.startsWith("category/")) {
+      if (
+        path.startsWith("category/")
+      ) {
 
-        const categoryId =
+        const id =
           path.substring(
             "category/".length
           );
 
 
-        if (!categoryId) {
-
-          return addCors(
-            jsonError(
-              "Missing category ID",
-              400
-            )
+        const channels =
+          await getCategoryChannels(
+            id
           );
-        }
 
 
-        return addCors(
-          await categoryRoute(
-            categoryId
-          )
+        return cors(
+          json({
+
+            ok: true,
+
+            category_id:
+              id,
+
+            count:
+              channels.length,
+
+            channels:
+              channels.map(
+                (channel, index) => ({
+
+                  number:
+                    index + 1,
+
+                  direct:
+                    `/c/${channel.id}`,
+
+                  live:
+                    `/live/${channel.id}.m3u8`,
+
+                  ...channel
+                })
+              )
+          })
         );
       }
 
@@ -198,25 +239,22 @@ export default {
       // /c/1424
       // ======================================================================
 
-      if (path.startsWith("c/")) {
+      if (
+        path.startsWith("c/")
+      ) {
 
         let channelId =
-          path.substring(
-            "c/".length
-          );
-
-
-        channelId =
-          channelId.replace(
-            /\.m3u8$/i,
-            ""
-          );
+          path.substring(2)
+            .replace(
+              /\.m3u8$/i,
+              ""
+            );
 
 
         if (!channelId) {
 
-          return addCors(
-            jsonError(
+          return cors(
+            errorJson(
               "Missing channel ID",
               400
             )
@@ -224,28 +262,25 @@ export default {
         }
 
 
-        const destination =
-
-          `${requestUrl.origin}/live/` +
-
-          `${encodeURIComponent(channelId)}.m3u8`;
-
-
         return Response.redirect(
-          destination,
+
+          `${url.origin}/live/${encodeURIComponent(channelId)}.m3u8`,
+
           302
         );
       }
 
 
       // ======================================================================
-      // STABLE LIVE URL
+      // STABLE LIVE ENTRY
       //
       // /live/1424.m3u8
       //
       // ======================================================================
 
-      if (path.startsWith("live/")) {
+      if (
+        path.startsWith("live/")
+      ) {
 
         let channelId =
           path.substring(
@@ -262,16 +297,16 @@ export default {
 
         if (!channelId) {
 
-          return addCors(
-            jsonError(
-              "Missing live channel ID",
+          return cors(
+            errorJson(
+              "Missing channel ID",
               400
             )
           );
         }
 
 
-        return await liveManifestRoute(
+        return await liveEntry(
           request,
           channelId
         );
@@ -279,7 +314,41 @@ export default {
 
 
       // ======================================================================
-      // RESOURCE PROXY
+      // LOCKED SESSION
+      // ======================================================================
+
+      if (
+        path.startsWith("_session/")
+      ) {
+
+        const parts =
+          path.split("/");
+
+
+        const sid =
+          parts[1];
+
+
+        if (!sid) {
+
+          return cors(
+            errorJson(
+              "Missing session ID",
+              400
+            )
+          );
+        }
+
+
+        return await lockedManifest(
+          request,
+          sid
+        );
+      }
+
+
+      // ======================================================================
+      // RESOURCE
       // ======================================================================
 
       if (path === "_resource") {
@@ -291,27 +360,13 @@ export default {
 
 
       // ======================================================================
-      // /1 /2 /3 ...
+      // /1 /2 /3...
       // ======================================================================
 
       if (/^\d+$/.test(path)) {
 
         const number =
           Number(path);
-
-
-        if (
-          !Number.isInteger(number) ||
-          number < 1
-        ) {
-
-          return addCors(
-            jsonError(
-              "Invalid channel number",
-              400
-            )
-          );
-        }
 
 
         const channels =
@@ -321,16 +376,13 @@ export default {
 
 
         if (
-          number >
-          channels.length
+          number < 1 ||
+          number > channels.length
         ) {
 
-          return addCors(
-            jsonError(
-
-              `Channel ${number} not found. ` +
-              `Available: ${channels.length}`,
-
+          return cors(
+            errorJson(
+              "Invalid channel number",
               404
             )
           );
@@ -338,40 +390,22 @@ export default {
 
 
         const channel =
-          channels[number - 1];
-
-
-        if (
-          !channel ||
-          channel.id === undefined ||
-          channel.id === null
-        ) {
-
-          return addCors(
-            jsonError(
-              "Invalid channel information",
-              500
-            )
-          );
-        }
-
-
-        const destination =
-
-          `${requestUrl.origin}/live/` +
-
-          `${encodeURIComponent(channel.id)}.m3u8`;
+          channels[
+            number - 1
+          ];
 
 
         return Response.redirect(
-          destination,
+
+          `${url.origin}/live/${encodeURIComponent(channel.id)}.m3u8`,
+
           302
         );
       }
 
 
-      return addCors(
-        jsonError(
+      return cors(
+        errorJson(
           "Route not found",
           404
         )
@@ -381,10 +415,11 @@ export default {
 
     catch (error) {
 
-      return addCors(
-        jsonError(
+      return cors(
+        errorJson(
           error?.message ||
           String(error),
+
           500
         )
       );
@@ -394,21 +429,15 @@ export default {
 
 
 // ============================================================================
-// API FETCH
-//
-// IMPORTANT:
-// NO "cache:" RequestInitializer option.
+// API
 // ============================================================================
 
-async function apiFetch(endpoint) {
-
-  const cleanEndpoint =
-    String(endpoint)
-      .replace(/^\/+/, "");
-
+async function apiFetch(
+  endpoint
+) {
 
   const url =
-    `${CONFIG.API_BASE}/${cleanEndpoint}`;
+    `${CONFIG.API_BASE}/${String(endpoint).replace(/^\/+/, "")}`;
 
 
   const headers =
@@ -423,30 +452,28 @@ async function apiFetch(endpoint) {
 
   headers.set(
     "Accept",
-    CONFIG.API_ACCEPT
+    "application/json"
   );
 
 
   headers.set(
     "Cache-Control",
-    "no-cache, no-store, max-age=0"
-  );
-
-
-  headers.set(
-    "Pragma",
     "no-cache"
   );
 
 
   const response =
-    await fetch(
+    await timedFetch(
+
       url,
+
       {
         method: "GET",
-        headers: headers,
+        headers,
         redirect: "follow"
-      }
+      },
+
+      CONFIG.API_TIMEOUT_MS
     );
 
 
@@ -459,45 +486,35 @@ async function apiFetch(endpoint) {
 
 
   const t =
-    response.headers.get("t") ||
-    response.headers.get("T") ||
-    "";
+    response.headers.get("t") || "";
 
 
   if (!t) {
 
     throw new Error(
-      'Missing API response header "t"'
+      "Missing API t header"
     );
   }
 
 
-  const encrypted =
+  const body =
     (await response.text())
       .trim();
 
 
-  if (!encrypted) {
-
-    throw new Error(
-      "Empty API response"
-    );
-  }
-
-
-  return decryptPayload(
-    encrypted,
+  return decryptApi(
+    body,
     t
   );
 }
 
 
 // ============================================================================
-// BASE64 + XOR
+// DECRYPT
 // ============================================================================
 
-function decryptPayload(
-  encryptedBase64,
+function decryptApi(
+  encrypted,
   t
 ) {
 
@@ -507,21 +524,19 @@ function decryptPayload(
   try {
 
     binary =
-      atob(
-        encryptedBase64
-      );
+      atob(encrypted);
 
   }
 
   catch {
 
     throw new Error(
-      "Invalid API Base64"
+      "Invalid Base64 response"
     );
   }
 
 
-  const encryptedBytes =
+  const input =
     new Uint8Array(
       binary.length
     );
@@ -533,51 +548,42 @@ function decryptPayload(
     i++
   ) {
 
-    encryptedBytes[i] =
+    input[i] =
       binary.charCodeAt(i);
   }
 
 
-  const finalKey =
-    CONFIG.STATIC_KEY +
-    String(t);
-
-
-  const keyBytes =
+  const key =
     new TextEncoder()
       .encode(
-        finalKey
+        CONFIG.STATIC_KEY +
+        String(t)
       );
 
 
   const output =
     new Uint8Array(
-      encryptedBytes.length
+      input.length
     );
 
 
   for (
     let i = 0;
-    i < encryptedBytes.length;
+    i < input.length;
     i++
   ) {
 
     output[i] =
-
-      encryptedBytes[i] ^
-
-      keyBytes[
-        i % keyBytes.length
+      input[i] ^
+      key[
+        i % key.length
       ];
   }
 
 
   const text =
-    new TextDecoder(
-      "utf-8"
-    ).decode(
-      output
-    );
+    new TextDecoder()
+      .decode(output);
 
 
   try {
@@ -591,17 +597,19 @@ function decryptPayload(
   catch {
 
     throw new Error(
-      "Decrypted API JSON is invalid"
+      "Invalid decrypted JSON"
     );
   }
 }
 
 
 // ============================================================================
-// NORMALIZE
+// DATA NORMALIZATION
 // ============================================================================
 
-function normalizeData(payload) {
+function normalize(
+  payload
+) {
 
   if (
     payload &&
@@ -621,20 +629,16 @@ function normalizeData(payload) {
 
 
 // ============================================================================
-// GET CATEGORIES
+// CATEGORIES
 // ============================================================================
 
 async function getCategories() {
 
-  const payload =
-    await apiFetch(
-      "categories"
-    );
-
-
   const data =
-    normalizeData(
-      payload
+    normalize(
+      await apiFetch(
+        "categories"
+      )
     );
 
 
@@ -651,23 +655,19 @@ async function getCategories() {
 
 
 // ============================================================================
-// GET CATEGORY CHANNELS
+// CHANNELS
 // ============================================================================
 
 async function getCategoryChannels(
   categoryId
 ) {
 
-  const payload =
-    await apiFetch(
-
-      `categories/${encodeURIComponent(categoryId)}/channels`
-    );
-
-
   const data =
-    normalizeData(
-      payload
+    normalize(
+      await apiFetch(
+
+        `categories/${encodeURIComponent(categoryId)}/channels`
+      )
     );
 
 
@@ -684,23 +684,19 @@ async function getCategoryChannels(
 
 
 // ============================================================================
-// GET STREAM
+// PLAYBACK INFO
 // ============================================================================
 
 async function getChannelStream(
   channelId
 ) {
 
-  const payload =
-    await apiFetch(
-
-      `channel/${encodeURIComponent(channelId)}`
-    );
-
-
   let data =
-    normalizeData(
-      payload
+    normalize(
+      await apiFetch(
+
+        `channel/${encodeURIComponent(channelId)}`
+      )
     );
 
 
@@ -709,31 +705,21 @@ async function getChannelStream(
     if (!data.length) {
 
       throw new Error(
-        "No streams found"
+        "No playback servers"
       );
     }
 
 
-    const valid =
+    data =
       data.find(
         item =>
-
           item &&
-
-          typeof item ===
-            "object" &&
-
           (
             item.url ||
             item.stream_url ||
             item.link
           )
-      );
-
-
-    data =
-      valid ||
-      data[0];
+      ) || data[0];
   }
 
 
@@ -743,293 +729,551 @@ async function getChannelStream(
   ) {
 
     throw new Error(
-      "Invalid channel stream response"
+      "Invalid playback data"
     );
   }
 
 
   const streamUrl =
-
     data.url ||
-
     data.stream_url ||
-
     data.link;
 
 
   if (!streamUrl) {
 
     throw new Error(
-      "No stream URL"
+      "Missing stream URL"
     );
   }
 
 
-  validateHttpUrl(
+  checkUrl(
     streamUrl
   );
 
 
-  const referer =
-
-    data.referer ||
-
-    data.headers?.Referer ||
-
-    data.headers?.referer ||
-
-    CONFIG.DEFAULT_REFERER;
-
-
-  const userAgent =
-
-    data.user_agent ||
-
-    data.userAgent ||
-
-    data.headers?.["User-Agent"] ||
-
-    data.headers?.["user-agent"] ||
-
-    CONFIG.DEFAULT_PLAYER_UA;
-
-
   return {
 
-    id:
+    channelId:
       String(channelId),
 
     url:
       streamUrl,
 
     referer:
-      referer,
+
+      data.referer ||
+
+      data.headers?.Referer ||
+
+      CONFIG.DEFAULT_REFERER,
 
     userAgent:
-      userAgent
+
+      data.user_agent ||
+
+      data.headers?.["User-Agent"] ||
+
+      CONFIG.DEFAULT_PLAYER_UA
   };
 }
 
 
 // ============================================================================
-// LIVE MANIFEST
+// LIVE ENTRY
 // ============================================================================
 
-async function liveManifestRoute(
+async function liveEntry(
   request,
   channelId
 ) {
 
-  // Always fetch fresh playback information.
+  // Try to reuse the SAME session for repeated /live requests.
+  const currentSid =
+    await getDefaultSessionId(
+      channelId
+    );
+
+
+  if (currentSid) {
+
+    const existing =
+      await loadSession(
+        currentSid
+      );
+
+
+    if (
+      existing &&
+      existing.channelId ===
+        String(channelId)
+    ) {
+
+      return Response.redirect(
+
+        new URL(request.url).origin +
+        `/_session/${currentSid}.m3u8`,
+
+        302
+      );
+    }
+  }
+
+
+  // ========================================================================
+  // CREATE NEW LOCKED TIMELINE
+  // ========================================================================
+
   const stream =
     await getChannelStream(
       channelId
     );
 
 
-  return await fetchManifest(
+  const initial =
+    await selectInitialTimeline(
+      request,
+      stream
+    );
 
-    request,
 
-    stream.url,
+  const sid =
+    crypto.randomUUID();
 
-    stream.referer,
 
-    stream.userAgent,
+  const state = {
 
-    channelId
+    sid,
+
+    channelId:
+      String(channelId),
+
+    upstreamUrl:
+      stream.url,
+
+    referer:
+      stream.referer,
+
+    userAgent:
+      stream.userAgent,
+
+    profile:
+      initial.profile,
+
+    lastSequence:
+      initial.sequence,
+
+    lastManifest:
+      initial.text,
+
+    lastManifestUrl:
+      initial.finalUrl,
+
+    created:
+      Date.now()
+  };
+
+
+  await saveSession(
+    state
+  );
+
+
+  await saveDefaultSession(
+    channelId,
+    sid
+  );
+
+
+  return Response.redirect(
+
+    new URL(request.url).origin +
+    `/_session/${sid}.m3u8`,
+
+    302
   );
 }
 
 
 // ============================================================================
-// FETCH MANIFEST
+// INITIAL TIMELINE SELECTION
 // ============================================================================
 
-async function fetchManifest(
-
+async function selectInitialTimeline(
   request,
-
-  manifestUrl,
-
-  referer,
-
-  userAgent,
-
-  channelId
+  stream
 ) {
 
-  validateHttpUrl(
-    manifestUrl
-  );
+  const candidates = [];
 
 
-  const requestHeaders =
-    buildUpstreamHeaders(
+  for (
+    let i = 0;
+    i < CONFIG.MANIFEST_SAMPLES;
+    i++
+  ) {
 
-      request,
+    try {
 
-      referer,
+      const item =
+        await fetchManifestCandidate(
 
-      userAgent
+          request,
+
+          stream.url,
+
+          stream.referer,
+
+          stream.userAgent
+        );
+
+
+      candidates.push(
+        item
+      );
+
+    }
+
+    catch {
+      // Try another sample.
+    }
+  }
+
+
+  if (!candidates.length) {
+
+    throw new Error(
+      "Unable to obtain HLS playlist"
     );
+  }
 
 
-  requestHeaders.set(
-    "Cache-Control",
-    "no-cache, no-store, max-age=0"
-  );
+  // ========================================================================
+  // GROUP BY TIMELINE PROFILE
+  //
+  // Example:
+  //
+  // 4|pdf
+  // 6|js
+  //
+  // ========================================================================
+
+  const groups =
+    new Map();
 
 
-  requestHeaders.set(
-    "Pragma",
-    "no-cache"
-  );
+  for (
+    const item of candidates
+  ) {
+
+    if (
+      !groups.has(
+        item.profile
+      )
+    ) {
+
+      groups.set(
+        item.profile,
+        []
+      );
+    }
 
 
-  let upstream =
-    await fetch(
-      manifestUrl,
-      {
-        method: "GET",
-        headers: requestHeaders,
-        redirect: "follow"
+    groups.get(
+      item.profile
+    ).push(
+      item
+    );
+  }
+
+
+  let selectedGroup =
+    null;
+
+
+  for (
+    const group
+    of groups.values()
+  ) {
+
+    if (
+      !selectedGroup ||
+      group.length >
+        selectedGroup.length
+    ) {
+
+      selectedGroup =
+        group;
+    }
+
+    else if (
+      group.length ===
+        selectedGroup.length
+    ) {
+
+      // In a tie prefer shorter target duration.
+      const a =
+        group[0].targetDuration || 999;
+
+
+      const b =
+        selectedGroup[0]
+          .targetDuration || 999;
+
+
+      if (a < b) {
+
+        selectedGroup =
+          group;
       }
+    }
+  }
+
+
+  // Choose freshest sequence from selected timeline.
+  selectedGroup.sort(
+    (a, b) =>
+      b.sequence -
+      a.sequence
+  );
+
+
+  return selectedGroup[0];
+}
+
+
+// ============================================================================
+// LOCKED MANIFEST
+// ============================================================================
+
+async function lockedManifest(
+  request,
+  sidPath
+) {
+
+  const sid =
+    sidPath.replace(
+      /\.m3u8$/i,
+      ""
     );
 
 
-  // Fresh channel info if manifest token itself is rejected.
+  let state =
+    await loadSession(
+      sid
+    );
+
+
+  if (!state) {
+
+    return cors(
+      errorJson(
+        "Session expired. Reopen /live/{channel}.m3u8",
+        410
+      )
+    );
+  }
+
+
+  // ========================================================================
+  // REAL TOKEN EXPIRY
+  // ========================================================================
+
   if (
-    upstream.status === 401 ||
-    upstream.status === 403
+    tokenNearExpiry(
+      state.upstreamUrl
+    )
   ) {
 
-    const fresh =
-      await getChannelStream(
-        channelId
-      );
-
-
-    const freshHeaders =
-      buildUpstreamHeaders(
-
+    state =
+      await renewLockedRoot(
         request,
-
-        fresh.referer,
-
-        fresh.userAgent
+        state
       );
-
-
-    freshHeaders.set(
-      "Cache-Control",
-      "no-cache, no-store, max-age=0"
-    );
-
-
-    freshHeaders.set(
-      "Pragma",
-      "no-cache"
-    );
-
-
-    upstream =
-      await fetch(
-        fresh.url,
-        {
-          method: "GET",
-          headers: freshHeaders,
-          redirect: "follow"
-        }
-      );
-
-
-    manifestUrl =
-      fresh.url;
-
-
-    referer =
-      fresh.referer;
-
-
-    userAgent =
-      fresh.userAgent;
   }
 
 
-  if (!upstream.ok) {
-
-    return addCors(
-      jsonError(
-
-        `Manifest upstream HTTP ${upstream.status}`,
-
-        upstream.status
-      )
-    );
-  }
+  let best =
+    null;
 
 
-  const manifest =
-    await upstream.text();
+  // ========================================================================
+  // SAMPLE SAME ROOT BUT ACCEPT ONLY LOCKED PROFILE
+  // ========================================================================
 
-
-  if (
-    !manifest
-      .trimStart()
-      .startsWith("#EXTM3U")
+  for (
+    let i = 0;
+    i < CONFIG.MANIFEST_SAMPLES;
+    i++
   ) {
 
-    return addCors(
-      jsonError(
-        "Upstream is not an HLS manifest",
-        502
-      )
+    try {
+
+      const candidate =
+        await fetchManifestCandidate(
+
+          request,
+
+          state.upstreamUrl,
+
+          state.referer,
+
+          state.userAgent
+        );
+
+
+      if (
+        candidate.profile !==
+        state.profile
+      ) {
+
+        // Critical:
+        // upstream returned another timeline.
+        // Ignore it completely.
+        continue;
+      }
+
+
+      if (
+        !best ||
+        candidate.sequence >
+          best.sequence
+      ) {
+
+        best =
+          candidate;
+      }
+
+    }
+
+    catch {
+      // Next sample.
+    }
+  }
+
+
+  // ========================================================================
+  // ROOT FAILED OR PROFILE DISAPPEARED
+  // ========================================================================
+
+  if (!best) {
+
+    state =
+      await renewLockedRoot(
+        request,
+        state
+      );
+
+
+    best =
+      await findLockedCandidate(
+        request,
+        state
+      );
+  }
+
+
+  // ========================================================================
+  // NEVER GO BACKWARDS
+  // ========================================================================
+
+  if (
+    best.sequence <
+      state.lastSequence &&
+    state.lastManifest
+  ) {
+
+    best = {
+
+      text:
+        state.lastManifest,
+
+      finalUrl:
+        state.lastManifestUrl,
+
+      sequence:
+        state.lastSequence,
+
+      profile:
+        state.profile,
+
+      targetDuration:
+        getTargetDuration(
+          state.lastManifest
+        )
+    };
+  }
+
+
+  // ========================================================================
+  // SAVE NEW FORWARD STATE
+  // ========================================================================
+
+  if (
+    best.sequence >=
+    state.lastSequence
+  ) {
+
+    state.lastSequence =
+      best.sequence;
+
+
+    state.lastManifest =
+      best.text;
+
+
+    state.lastManifestUrl =
+      best.finalUrl;
+
+
+    await saveSession(
+      state
     );
   }
 
 
-  const finalUrl =
-    upstream.url ||
-    manifestUrl;
-
-
-  const workerUrl =
-    new URL(
-      request.url
-    );
+  const origin =
+    new URL(request.url)
+      .origin;
 
 
   const rewritten =
     rewriteManifest(
 
-      manifest,
+      best.text,
 
-      finalUrl,
+      best.finalUrl,
 
-      workerUrl.origin,
+      origin,
 
-      referer,
+      sid,
 
-      userAgent,
-
-      channelId
+      state
     );
 
 
-  const responseHeaders =
-    livePlaylistHeaders();
+  const headers =
+    playlistHeaders();
 
 
-  responseHeaders.set(
+  headers.set(
     "X-YCN-Version",
-    "4.0"
+    "5.0"
   );
 
 
-  responseHeaders.set(
-    "X-YCN-Channel",
-    channelId
+  headers.set(
+    "X-YCN-Profile",
+    state.profile
+  );
+
+
+  headers.set(
+    "X-YCN-Sequence",
+    String(
+      state.lastSequence
+    )
   );
 
 
@@ -1037,24 +1281,24 @@ async function fetchManifest(
     request.method === "HEAD"
   ) {
 
-    return addCors(
+    return cors(
       new Response(
         null,
         {
           status: 200,
-          headers: responseHeaders
+          headers
         }
       )
     );
   }
 
 
-  return addCors(
+  return cors(
     new Response(
       rewritten,
       {
         status: 200,
-        headers: responseHeaders
+        headers
       }
     )
   );
@@ -1062,106 +1306,214 @@ async function fetchManifest(
 
 
 // ============================================================================
-// RESOURCE PROXY
+// FIND CANDIDATE MATCHING LOCK
 // ============================================================================
 
-async function proxyResource(
-  request
+async function findLockedCandidate(
+  request,
+  state
 ) {
 
-  const workerUrl =
-    new URL(
-      request.url
-    );
+  let best =
+    null;
 
 
-  let upstreamUrl =
-    workerUrl.searchParams.get(
-      "u"
-    );
-
-
-  const channelId =
-    workerUrl.searchParams.get(
-      "cid"
-    ) || "";
-
-
-  let referer =
-    workerUrl.searchParams.get(
-      "r"
-    ) ||
-    CONFIG.DEFAULT_REFERER;
-
-
-  let userAgent =
-    workerUrl.searchParams.get(
-      "a"
-    ) ||
-    CONFIG.DEFAULT_PLAYER_UA;
-
-
-  if (!upstreamUrl) {
-
-    return addCors(
-      jsonError(
-        "Missing resource URL",
-        400
-      )
-    );
-  }
-
-
-  validateHttpUrl(
-    upstreamUrl
-  );
-
-
-  // ========================================================================
-  // REFRESH BEFORE EXPIRATION
-  // ========================================================================
-
-  if (
-    channelId &&
-    shouldRefreshToken(
-      upstreamUrl
-    )
+  for (
+    let i = 0;
+    i < 5;
+    i++
   ) {
 
-    const refreshed =
-      await refreshResourceContext(
+    try {
 
-        upstreamUrl,
+      const item =
+        await fetchManifestCandidate(
 
-        channelId
-      );
+          request,
 
+          state.upstreamUrl,
 
-    upstreamUrl =
-      refreshed.url;
+          state.referer,
 
-
-    referer =
-      refreshed.referer ||
-      referer;
+          state.userAgent
+        );
 
 
-    userAgent =
-      refreshed.userAgent ||
-      userAgent;
+      if (
+        item.profile !==
+        state.profile
+      ) {
+
+        continue;
+      }
+
+
+      if (
+        !best ||
+        item.sequence >
+          best.sequence
+      ) {
+
+        best =
+          item;
+      }
+
+    }
+
+    catch {
+      //
+    }
   }
 
 
-  // ========================================================================
-  // REQUEST
-  // ========================================================================
+  if (!best) {
 
-  let upstream =
-    await fetchUpstreamResource(
+    throw new Error(
+      `Locked timeline ${state.profile} unavailable`
+    );
+  }
+
+
+  return best;
+}
+
+
+// ============================================================================
+// TOKEN / ROOT RENEWAL
+// ============================================================================
+
+async function renewLockedRoot(
+  request,
+  oldState
+) {
+
+  let fallback =
+    null;
+
+
+  // Try multiple API resolutions until SAME profile appears.
+  for (
+    let i = 0;
+    i < 8;
+    i++
+  ) {
+
+    try {
+
+      const fresh =
+        await getChannelStream(
+          oldState.channelId
+        );
+
+
+      const candidate =
+        await fetchManifestCandidate(
+
+          request,
+
+          fresh.url,
+
+          fresh.referer,
+
+          fresh.userAgent
+        );
+
+
+      if (!fallback) {
+
+        fallback = {
+          fresh,
+          candidate
+        };
+      }
+
+
+      if (
+        candidate.profile ===
+        oldState.profile
+      ) {
+
+        oldState.upstreamUrl =
+          fresh.url;
+
+
+        oldState.referer =
+          fresh.referer;
+
+
+        oldState.userAgent =
+          fresh.userAgent;
+
+
+        // Only advance sequence.
+        if (
+          candidate.sequence >=
+          oldState.lastSequence
+        ) {
+
+          oldState.lastSequence =
+            candidate.sequence;
+
+
+          oldState.lastManifest =
+            candidate.text;
+
+
+          oldState.lastManifestUrl =
+            candidate.finalUrl;
+        }
+
+
+        await saveSession(
+          oldState
+        );
+
+
+        return oldState;
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  // Keep old source while still usable rather than jumping timelines.
+  if (
+    oldState.upstreamUrl
+  ) {
+
+    return oldState;
+  }
+
+
+  throw new Error(
+    "Unable to renew locked timeline"
+  );
+}
+
+
+// ============================================================================
+// MANIFEST CANDIDATE
+// ============================================================================
+
+async function fetchManifestCandidate(
+
+  request,
+
+  upstreamUrl,
+
+  referer,
+
+  userAgent
+) {
+
+  const headers =
+    upstreamHeaders(
 
       request,
-
-      upstreamUrl,
 
       referer,
 
@@ -1169,68 +1521,262 @@ async function proxyResource(
     );
 
 
-  // ========================================================================
-  // 401 / 403 => REFRESH TOKEN AND RETRY
-  // ========================================================================
-
-  if (
-    channelId &&
-    (
-      upstream.status === 401 ||
-      upstream.status === 403
-    )
-  ) {
-
-    const refreshed =
-      await refreshResourceContext(
-
-        upstreamUrl,
-
-        channelId,
-
-        true
-      );
+  headers.set(
+    "Cache-Control",
+    "no-cache"
+  );
 
 
-    upstreamUrl =
-      refreshed.url;
+  const response =
+    await timedFetch(
+
+      upstreamUrl,
+
+      {
+        method: "GET",
+        headers,
+        redirect: "follow"
+      },
+
+      CONFIG.MANIFEST_TIMEOUT_MS
+    );
 
 
-    referer =
-      refreshed.referer ||
-      referer;
+  if (!response.ok) {
 
-
-    userAgent =
-      refreshed.userAgent ||
-      userAgent;
-
-
-    upstream =
-      await fetchUpstreamResource(
-
-        request,
-
-        upstreamUrl,
-
-        referer,
-
-        userAgent
-      );
+    throw new Error(
+      `Manifest HTTP ${response.status}`
+    );
   }
 
 
-  if (!upstream.ok) {
+  const text =
+    await response.text();
 
-    return addCors(
-      new Response(
 
-        `Upstream HTTP ${upstream.status}`,
+  if (
+    !text
+      .trimStart()
+      .startsWith(
+        "#EXTM3U"
+      )
+  ) {
+
+    throw new Error(
+      "Not HLS"
+    );
+  }
+
+
+  const finalUrl =
+    response.url ||
+    upstreamUrl;
+
+
+  const targetDuration =
+    getTargetDuration(
+      text
+    );
+
+
+  const sequence =
+    getMediaSequence(
+      text
+    );
+
+
+  const extension =
+    detectSegmentFamily(
+      text,
+      finalUrl
+    );
+
+
+  return {
+
+    text,
+
+    finalUrl,
+
+    targetDuration,
+
+    sequence,
+
+    extension,
+
+    profile:
+      `${targetDuration}|${extension}`
+  };
+}
+
+
+// ============================================================================
+// RESOURCE
+// ============================================================================
+
+async function proxyResource(
+  request
+) {
+
+  const url =
+    new URL(request.url);
+
+
+  const upstreamUrl =
+    url.searchParams.get("u");
+
+
+  const sid =
+    url.searchParams.get("sid");
+
+
+  if (
+    !upstreamUrl ||
+    !sid
+  ) {
+
+    return cors(
+      errorJson(
+        "Invalid resource request",
+        400
+      )
+    );
+  }
+
+
+  const state =
+    await loadSession(
+      sid
+    );
+
+
+  if (!state) {
+
+    return cors(
+      errorJson(
+        "Stream session expired",
+        410
+      )
+    );
+  }
+
+
+  // ========================================================================
+  // FIRST TRY
+  // ========================================================================
+
+  let response =
+    null;
+
+
+  try {
+
+    response =
+      await timedFetch(
+
+        upstreamUrl,
 
         {
+          method: "GET",
 
+          headers:
+            upstreamHeaders(
+
+              request,
+
+              state.referer,
+
+              state.userAgent
+            ),
+
+          redirect: "follow"
+        },
+
+        CONFIG.SEGMENT_TIMEOUT_MS
+      );
+
+  }
+
+  catch {
+    response = null;
+  }
+
+
+  // ========================================================================
+  // FAILED HOST => FIND SAME RESOURCE ON CURRENT LOCKED PLAYLIST
+  // ========================================================================
+
+  if (
+    !response ||
+    !response.ok
+  ) {
+
+    const alternative =
+      await recoverResourceUrl(
+
+        request,
+
+        state,
+
+        upstreamUrl
+      );
+
+
+    if (alternative) {
+
+      try {
+
+        response =
+          await timedFetch(
+
+            alternative,
+
+            {
+              method: "GET",
+
+              headers:
+                upstreamHeaders(
+
+                  request,
+
+                  state.referer,
+
+                  state.userAgent
+                ),
+
+              redirect:
+                "follow"
+            },
+
+            CONFIG.SEGMENT_TIMEOUT_MS
+          );
+
+      }
+
+      catch {
+        response = null;
+      }
+    }
+  }
+
+
+  if (
+    !response ||
+    !response.ok
+  ) {
+
+    return cors(
+      new Response(
+
+        response
+          ? `Upstream HTTP ${response.status}`
+          : "Upstream segment timeout",
+
+        {
           status:
-            upstream.status,
+            response
+              ? response.status
+              : 504,
 
           headers: {
 
@@ -1247,159 +1793,122 @@ async function proxyResource(
 
 
   const finalUrl =
-    upstream.url ||
+    response.url ||
     upstreamUrl;
 
 
-  const contentType =
-    upstream.headers.get(
+  const type =
+    response.headers.get(
       "Content-Type"
     ) || "";
 
 
   // ========================================================================
-  // CHILD MANIFEST
+  // CHILD M3U8
   // ========================================================================
 
   if (
-    isManifestResponse(
+    isManifest(
       finalUrl,
-      contentType
+      type
     )
   ) {
 
     const text =
-      await upstream.text();
+      await response.text();
 
 
-    if (
-      text
-        .trimStart()
-        .startsWith("#EXTM3U")
-    ) {
+    const rewritten =
+      rewriteManifest(
 
-      const rewritten =
-        rewriteManifest(
+        text,
 
-          text,
+        finalUrl,
 
-          finalUrl,
+        url.origin,
 
-          workerUrl.origin,
+        sid,
 
-          referer,
-
-          userAgent,
-
-          channelId
-        );
-
-
-      const headers =
-        livePlaylistHeaders();
-
-
-      headers.set(
-        "X-YCN-Version",
-        "4.0"
+        state
       );
 
 
-      return addCors(
-        new Response(
-          request.method === "HEAD"
-            ? null
-            : rewritten,
-          {
-            status: 200,
-            headers: headers
-          }
-        )
-      );
-    }
+    return cors(
+      new Response(
+        rewritten,
+        {
+          status: 200,
+          headers:
+            playlistHeaders()
+        }
+      )
+    );
   }
 
 
   // ========================================================================
-  // BINARY SEGMENT / KEY
+  // SEGMENT / AES KEY
   // ========================================================================
 
-  const responseHeaders =
+  const headers =
     new Headers();
 
 
   copyHeader(
-    upstream.headers,
-    responseHeaders,
+    response.headers,
+    headers,
     "Content-Length"
   );
 
 
   copyHeader(
-    upstream.headers,
-    responseHeaders,
+    response.headers,
+    headers,
     "Content-Range"
   );
 
 
   copyHeader(
-    upstream.headers,
-    responseHeaders,
+    response.headers,
+    headers,
     "Accept-Ranges"
   );
 
 
-  copyHeader(
-    upstream.headers,
-    responseHeaders,
-    "ETag"
-  );
-
-
-  copyHeader(
-    upstream.headers,
-    responseHeaders,
-    "Last-Modified"
-  );
-
-
-  responseHeaders.set(
-
+  headers.set(
     "Content-Type",
 
-    detectContentType(
+    mediaContentType(
       finalUrl,
-      contentType
+      type
     )
   );
 
 
-  responseHeaders.set(
+  headers.set(
     "Cache-Control",
     "no-store"
   );
 
 
-  responseHeaders.set(
+  headers.set(
     "X-YCN-Version",
-    "4.0"
+    "5.0"
   );
 
 
-  return addCors(
+  return cors(
     new Response(
 
       request.method === "HEAD"
         ? null
-        : upstream.body,
+        : response.body,
 
       {
-
         status:
-          upstream.status,
+          response.status,
 
-        headers:
-          responseHeaders
+        headers
       }
     )
   );
@@ -1407,53 +1916,535 @@ async function proxyResource(
 
 
 // ============================================================================
-// FETCH SEGMENT / KEY / CHILD PLAYLIST
-//
-// NO cache OPTION.
+// BAD SEGMENT HOST RECOVERY
 // ============================================================================
 
-async function fetchUpstreamResource(
+async function recoverResourceUrl(
 
   request,
 
-  upstreamUrl,
+  state,
 
-  referer,
-
-  userAgent
+  failedUrl
 ) {
 
-  const headers =
-    buildUpstreamHeaders(
-
-      request,
-
-      referer,
-
-      userAgent
+  const identity =
+    resourceIdentity(
+      failedUrl
     );
 
 
-  headers.set(
-    "Cache-Control",
-    "no-cache, no-store, max-age=0"
-  );
+  if (!identity) {
+
+    return null;
+  }
 
 
-  headers.set(
-    "Pragma",
-    "no-cache"
-  );
+  // Re-read same root several times but ONLY accept locked timeline.
+  for (
+    let attempt = 0;
+    attempt < 3;
+    attempt++
+  ) {
+
+    try {
+
+      const candidate =
+        await fetchManifestCandidate(
+
+          request,
+
+          state.upstreamUrl,
+
+          state.referer,
+
+          state.userAgent
+        );
 
 
-  return await fetch(
-    upstreamUrl,
-    {
-      method: "GET",
-      headers: headers,
-      redirect: "follow"
+      if (
+        candidate.profile !==
+        state.profile
+      ) {
+
+        continue;
+      }
+
+
+      const urls =
+        extractManifestResources(
+
+          candidate.text,
+
+          candidate.finalUrl
+        );
+
+
+      for (
+        const candidateUrl
+        of urls
+      ) {
+
+        if (
+          resourceIdentity(
+            candidateUrl
+          ) === identity &&
+          candidateUrl !== failedUrl
+        ) {
+
+          return candidateUrl;
+        }
+      }
+
     }
+
+    catch {
+      //
+    }
+  }
+
+
+  return null;
+}
+
+
+// ============================================================================
+// RESOURCE IDENTITY
+//
+// Different CDN hostname:
+//
+// h50.x/0021012254/918454578001/10889.pdf
+// h31.y/0021012254/918454578001/10889.pdf
+//
+// Same media resource.
+// ============================================================================
+
+function resourceIdentity(
+  value
+) {
+
+  try {
+
+    const url =
+      new URL(value);
+
+
+    const parts =
+      url.pathname
+        .split("/")
+        .filter(Boolean);
+
+
+    return parts
+      .slice(-2)
+      .join("/");
+
+  }
+
+  catch {
+
+    return null;
+  }
+}
+
+
+// ============================================================================
+// EXTRACT RESOURCE URLS
+// ============================================================================
+
+function extractManifestResources(
+  manifest,
+  manifestUrl
+) {
+
+  const base =
+    new URL(
+      manifestUrl
+    );
+
+
+  const result =
+    [];
+
+
+  for (
+    const line
+    of manifest.split(/\r?\n/)
+  ) {
+
+    const trimmed =
+      line.trim();
+
+
+    if (!trimmed) {
+      continue;
+    }
+
+
+    if (
+      !trimmed.startsWith("#")
+    ) {
+
+      try {
+
+        result.push(
+          inheritQuery(
+
+            new URL(
+              trimmed,
+              base
+            ),
+
+            base
+          ).href
+        );
+
+      }
+
+      catch {
+        //
+      }
+    }
+
+
+    const regex =
+      /URI=(["'])(.*?)\1/gi;
+
+
+    let match;
+
+
+    while (
+      (
+        match =
+          regex.exec(line)
+      ) !== null
+    ) {
+
+      try {
+
+        result.push(
+          inheritQuery(
+
+            new URL(
+              match[2],
+              base
+            ),
+
+            base
+          ).href
+        );
+
+      }
+
+      catch {
+        //
+      }
+    }
+  }
+
+
+  return result;
+}
+
+
+// ============================================================================
+// REWRITE MANIFEST
+// ============================================================================
+
+function rewriteManifest(
+
+  manifest,
+
+  manifestUrl,
+
+  origin,
+
+  sid,
+
+  state
+) {
+
+  const base =
+    new URL(
+      manifestUrl
+    );
+
+
+  return manifest
+    .split(/\r?\n/)
+    .map(
+      line => {
+
+        const trimmed =
+          line.trim();
+
+
+        if (!trimmed) {
+
+          return line;
+        }
+
+
+        // URI="..."
+        if (
+          trimmed.startsWith("#")
+        ) {
+
+          return line.replace(
+
+            /URI=(["'])(.*?)\1/gi,
+
+            (
+              whole,
+              quote,
+              value
+            ) => {
+
+              try {
+
+                const absolute =
+                  inheritQuery(
+
+                    new URL(
+                      value,
+                      base
+                    ),
+
+                    base
+                  ).href;
+
+
+                return (
+                  `URI=${quote}` +
+                  resourceWorkerUrl(
+                    origin,
+                    absolute,
+                    sid
+                  ) +
+                  `${quote}`
+                );
+
+              }
+
+              catch {
+
+                return whole;
+              }
+            }
+          );
+        }
+
+
+        try {
+
+          const absolute =
+            inheritQuery(
+
+              new URL(
+                trimmed,
+                base
+              ),
+
+              base
+            ).href;
+
+
+          return resourceWorkerUrl(
+
+            origin,
+
+            absolute,
+
+            sid
+          );
+
+        }
+
+        catch {
+
+          return line;
+        }
+      }
+    )
+    .join("\n");
+}
+
+
+// ============================================================================
+// RESOURCE WORKER URL
+// ============================================================================
+
+function resourceWorkerUrl(
+  origin,
+  upstream,
+  sid
+) {
+
+  const query =
+    new URLSearchParams();
+
+
+  query.set(
+    "u",
+    upstream
   );
+
+
+  query.set(
+    "sid",
+    sid
+  );
+
+
+  return (
+    `${origin}/_resource?` +
+    query.toString()
+  );
+}
+
+
+// ============================================================================
+// RELATIVE QUERY INHERITANCE
+// ============================================================================
+
+function inheritQuery(
+  target,
+  parent
+) {
+
+  for (
+    const [key, value]
+    of parent.searchParams.entries()
+  ) {
+
+    if (
+      !target.searchParams.has(
+        key
+      )
+    ) {
+
+      target.searchParams.set(
+        key,
+        value
+      );
+    }
+  }
+
+
+  return target;
+}
+
+
+// ============================================================================
+// TARGET DURATION
+// ============================================================================
+
+function getTargetDuration(
+  manifest
+) {
+
+  const match =
+    manifest.match(
+      /#EXT-X-TARGETDURATION:(\d+)/i
+    );
+
+
+  return match
+    ? Number(match[1])
+    : 0;
+}
+
+
+// ============================================================================
+// MEDIA SEQUENCE
+// ============================================================================
+
+function getMediaSequence(
+  manifest
+) {
+
+  const match =
+    manifest.match(
+      /#EXT-X-MEDIA-SEQUENCE:(\d+)/i
+    );
+
+
+  return match
+    ? Number(match[1])
+    : 0;
+}
+
+
+// ============================================================================
+// SEGMENT FAMILY
+// ============================================================================
+
+function detectSegmentFamily(
+  manifest,
+  manifestUrl
+) {
+
+  const base =
+    new URL(
+      manifestUrl
+    );
+
+
+  const lines =
+    manifest.split(
+      /\r?\n/
+    );
+
+
+  for (
+    const line of lines
+  ) {
+
+    const value =
+      line.trim();
+
+
+    if (
+      !value ||
+      value.startsWith("#")
+    ) {
+
+      continue;
+    }
+
+
+    try {
+
+      const path =
+        new URL(
+          value,
+          base
+        )
+          .pathname
+          .toLowerCase();
+
+
+      const match =
+        path.match(
+          /\.([a-z0-9]+)$/
+        );
+
+
+      if (match) {
+
+        return match[1];
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  return "unknown";
 }
 
 
@@ -1461,36 +2452,25 @@ async function fetchUpstreamResource(
 // TOKEN EXPIRY
 // ============================================================================
 
-function shouldRefreshToken(
-  url
+function tokenNearExpiry(
+  value
 ) {
 
   try {
 
-    const parsed =
-      new URL(url);
+    const url =
+      new URL(value);
 
 
     const expiry =
-      parsed.searchParams.get(
-        "e"
+      Number(
+        url.searchParams.get("e")
       );
 
 
-    if (!expiry) {
-
-      return false;
-    }
-
-
-    const expiryNumber =
-      Number(expiry);
-
-
     if (
-      !Number.isFinite(
-        expiryNumber
-      )
+      !Number.isFinite(expiry) ||
+      expiry <= 0
     ) {
 
       return false;
@@ -1504,10 +2484,8 @@ function shouldRefreshToken(
 
 
     return (
-      expiryNumber <=
-
-      now +
-
+      expiry -
+      now <=
       CONFIG
         .TOKEN_REFRESH_MARGIN_SECONDS
     );
@@ -1522,482 +2500,195 @@ function shouldRefreshToken(
 
 
 // ============================================================================
-// REFRESH RESOURCE TOKEN
+// EDGE SESSION STORAGE
 // ============================================================================
 
-async function refreshResourceContext(
-
-  oldResourceUrl,
-
-  channelId,
-
-  force = false
+function stateRequest(
+  sid
 ) {
+
+  return new Request(
+    `https://ycn-state.internal/session/${sid}`
+  );
+}
+
+
+function defaultSessionRequest(
+  channelId
+) {
+
+  return new Request(
+    `https://ycn-state.internal/channel/${channelId}`
+  );
+}
+
+
+async function saveSession(
+  state
+) {
+
+  const response =
+    new Response(
+
+      JSON.stringify(state),
+
+      {
+        headers: {
+
+          "Content-Type":
+            "application/json",
+
+          "Cache-Control":
+            `public, max-age=${CONFIG.SESSION_TTL_SECONDS}`
+        }
+      }
+    );
+
+
+  await caches.default.put(
+
+    stateRequest(
+      state.sid
+    ),
+
+    response
+  );
+}
+
+
+async function loadSession(
+  sid
+) {
+
+  const response =
+    await caches.default.match(
+      stateRequest(sid)
+    );
+
+
+  if (!response) {
+
+    return null;
+  }
+
 
   try {
 
-    if (
-      !force &&
-      !shouldRefreshToken(
-        oldResourceUrl
-      )
-    ) {
-
-      return {
-
-        url:
-          oldResourceUrl,
-
-        referer:
-          null,
-
-        userAgent:
-          null
-      };
-    }
-
-
-    const fresh =
-      await getChannelStream(
-        channelId
-      );
-
-
-    const freshRoot =
-      new URL(
-        fresh.url
-      );
-
-
-    const target =
-      new URL(
-        oldResourceUrl
-      );
-
-
-    // ======================================================================
-    // COPY ALL QUERY AUTH PARAMETERS FROM FRESH ROOT WHEN MATCHING
-    // ======================================================================
-
-    for (
-      const [key, value]
-      of freshRoot.searchParams.entries()
-    ) {
-
-      // Known auth / expiry values.
-      if (
-        key === "t" ||
-        key === "e" ||
-        key === "token" ||
-        key === "auth" ||
-        key === "expires" ||
-        key === "signature" ||
-        key === "sig"
-      ) {
-
-        target.searchParams.set(
-          key,
-          value
-        );
-      }
-    }
-
-
-    return {
-
-      url:
-        target.href,
-
-      referer:
-        fresh.referer,
-
-      userAgent:
-        fresh.userAgent
-    };
+    return await response.json();
 
   }
 
   catch {
 
-    return {
-
-      url:
-        oldResourceUrl,
-
-      referer:
-        null,
-
-      userAgent:
-        null
-    };
+    return null;
   }
 }
 
 
-// ============================================================================
-// MANIFEST REWRITE
-// ============================================================================
-
-function rewriteManifest(
-
-  manifest,
-
-  sourceManifestUrl,
-
-  workerOrigin,
-
-  referer,
-
-  userAgent,
-
-  channelId
+async function saveDefaultSession(
+  channelId,
+  sid
 ) {
 
-  const baseUrl =
-    new URL(
-      sourceManifestUrl
-    );
+  await caches.default.put(
 
-
-  const lines =
-    manifest.split(
-      /\r?\n/
-    );
-
-
-  const output =
-    [];
-
-
-  for (
-    const originalLine
-    of lines
-  ) {
-
-    const trimmed =
-      originalLine.trim();
-
-
-    if (!trimmed) {
-
-      output.push(
-        originalLine
-      );
-
-      continue;
-    }
-
-
-    // ======================================================================
-    // TAGS WITH URI=""
-    // ======================================================================
-
-    if (
-      trimmed.startsWith(
-        "#EXT-X-KEY:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-SESSION-KEY:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-MAP:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-MEDIA:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-I-FRAME-STREAM-INF:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-PART:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-PRELOAD-HINT:"
-      ) ||
-
-      trimmed.startsWith(
-        "#EXT-X-RENDITION-REPORT:"
-      )
-    ) {
-
-      output.push(
-        rewriteUriAttribute(
-
-          originalLine,
-
-          baseUrl,
-
-          workerOrigin,
-
-          referer,
-
-          userAgent,
-
-          channelId
-        )
-      );
-
-      continue;
-    }
-
-
-    // Normal HLS metadata.
-    if (
-      trimmed.startsWith("#")
-    ) {
-
-      output.push(
-        originalLine
-      );
-
-      continue;
-    }
-
-
-    // ======================================================================
-    // SEGMENT OR CHILD PLAYLIST
-    // ======================================================================
-
-    try {
-
-      const absolute =
-        resolveResourceUrl(
-
-          trimmed,
-
-          baseUrl
-        );
-
-
-      output.push(
-        buildResourceProxyUrl(
-
-          workerOrigin,
-
-          absolute,
-
-          referer,
-
-          userAgent,
-
-          channelId
-        )
-      );
-
-    }
-
-    catch {
-
-      output.push(
-        originalLine
-      );
-    }
-  }
-
-
-  return output.join(
-    "\n"
-  );
-}
-
-
-// ============================================================================
-// URI="..." REWRITE
-// ============================================================================
-
-function rewriteUriAttribute(
-
-  line,
-
-  baseUrl,
-
-  workerOrigin,
-
-  referer,
-
-  userAgent,
-
-  channelId
-) {
-
-  return line.replace(
-
-    /URI=(["'])(.*?)\1/gi,
-
-    (
-      full,
-      quote,
-      value
-    ) => {
-
-      try {
-
-        const absolute =
-          resolveResourceUrl(
-
-            value,
-
-            baseUrl
-          );
-
-
-        const proxy =
-          buildResourceProxyUrl(
-
-            workerOrigin,
-
-            absolute,
-
-            referer,
-
-            userAgent,
-
-            channelId
-          );
-
-
-        return (
-          `URI=${quote}${proxy}${quote}`
-        );
-
-      }
-
-      catch {
-
-        return full;
-      }
-    }
-  );
-}
-
-
-// ============================================================================
-// RESOLVE RESOURCE + INHERIT QUERY PARAMETERS
-// ============================================================================
-
-function resolveResourceUrl(
-
-  value,
-
-  baseUrl
-) {
-
-  const target =
-    new URL(
-      value,
-      baseUrl
-    );
-
-
-  // ========================================================================
-  // Relative playlist resources do not automatically inherit the query
-  // parameters of the parent playlist.
-  //
-  // Preserve authentication parameters when absent.
-  // ========================================================================
-
-  for (
-    const [key, val]
-    of baseUrl.searchParams.entries()
-  ) {
-
-    if (
-      !target.searchParams.has(
-        key
-      )
-    ) {
-
-      target.searchParams.set(
-        key,
-        val
-      );
-    }
-  }
-
-
-  return target.href;
-}
-
-
-// ============================================================================
-// RESOURCE WORKER URL
-// ============================================================================
-
-function buildResourceProxyUrl(
-
-  workerOrigin,
-
-  upstream,
-
-  referer,
-
-  userAgent,
-
-  channelId
-) {
-
-  const params =
-    new URLSearchParams();
-
-
-  params.set(
-    "u",
-    upstream
-  );
-
-
-  if (channelId) {
-
-    params.set(
-      "cid",
+    defaultSessionRequest(
       channelId
+    ),
+
+    new Response(
+      sid,
+      {
+        headers: {
+
+          "Cache-Control":
+            `public, max-age=${CONFIG.SESSION_TTL_SECONDS}`,
+
+          "Content-Type":
+            "text/plain"
+        }
+      }
+    )
+  );
+}
+
+
+async function getDefaultSessionId(
+  channelId
+) {
+
+  const response =
+    await caches.default.match(
+
+      defaultSessionRequest(
+        channelId
+      )
     );
-  }
 
 
-  if (referer) {
+  if (!response) {
 
-    params.set(
-      "r",
-      referer
-    );
-  }
-
-
-  if (userAgent) {
-
-    params.set(
-      "a",
-      userAgent
-    );
+    return null;
   }
 
 
   return (
-
-    `${workerOrigin}/_resource?` +
-
-    params.toString()
-  );
+    await response.text()
+  ).trim();
 }
 
 
 // ============================================================================
-// UPSTREAM HEADERS
+// FETCH WITH TIMEOUT
 // ============================================================================
 
-function buildUpstreamHeaders(
+async function timedFetch(
+  url,
+  options,
+  timeout
+) {
 
+  const controller =
+    new AbortController();
+
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      timeout
+    );
+
+
+  try {
+
+    return await fetch(
+      url,
+      {
+        ...options,
+        signal:
+          controller.signal
+      }
+    );
+
+  }
+
+  finally {
+
+    clearTimeout(
+      timer
+    );
+  }
+}
+
+
+// ============================================================================
+// HEADERS
+// ============================================================================
+
+function upstreamHeaders(
   request,
-
   referer,
-
   userAgent
 ) {
 
@@ -2048,163 +2739,22 @@ function buildUpstreamHeaders(
 }
 
 
-// ============================================================================
-// PLAYLIST RESPONSE HEADERS
-// ============================================================================
+function playlistHeaders() {
 
-function livePlaylistHeaders() {
+  return new Headers({
 
-  const headers =
-    new Headers();
+    "Content-Type":
+      "application/vnd.apple.mpegurl; charset=utf-8",
 
+    "Cache-Control":
+      "no-store, no-cache, must-revalidate, max-age=0",
 
-  headers.set(
-    "Content-Type",
-    "application/vnd.apple.mpegurl; charset=utf-8"
-  );
+    "Pragma":
+      "no-cache",
 
-
-  headers.set(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, max-age=0"
-  );
-
-
-  headers.set(
-    "Pragma",
-    "no-cache"
-  );
-
-
-  headers.set(
-    "Expires",
-    "0"
-  );
-
-
-  headers.set(
-    "X-Content-Type-Options",
-    "nosniff"
-  );
-
-
-  return headers;
-}
-
-
-// ============================================================================
-// CONTENT TYPE
-// ============================================================================
-
-function detectContentType(
-
-  url,
-
-  upstreamType
-) {
-
-  let pathname = "";
-
-
-  try {
-
-    pathname =
-      new URL(url)
-        .pathname
-        .toLowerCase();
-
-  }
-
-  catch {
-
-    pathname =
-      String(url)
-        .toLowerCase();
-  }
-
-
-  if (
-    pathname.endsWith(".m3u8")
-  ) {
-
-    return (
-      "application/vnd.apple.mpegurl"
-    );
-  }
-
-
-  if (
-    pathname.endsWith(".ts") ||
-    pathname.endsWith(".mpegts")
-  ) {
-
-    return "video/mp2t";
-  }
-
-
-  // Disguised transport-stream chunks.
-  if (
-    pathname.endsWith(".pdf") ||
-    pathname.endsWith(".js")
-  ) {
-
-    return "video/mp2t";
-  }
-
-
-  if (
-    pathname.endsWith(".m4s") ||
-    pathname.endsWith(".cmfv")
-  ) {
-
-    return "video/mp4";
-  }
-
-
-  if (
-    pathname.endsWith(".cmfa")
-  ) {
-
-    return "audio/mp4";
-  }
-
-
-  if (
-    pathname.endsWith(".mp4")
-  ) {
-
-    return "video/mp4";
-  }
-
-
-  if (
-    pathname.endsWith(".aac")
-  ) {
-
-    return "audio/aac";
-  }
-
-
-  if (
-    pathname.endsWith(".mp3")
-  ) {
-
-    return "audio/mpeg";
-  }
-
-
-  if (
-    upstreamType &&
-    !String(upstreamType)
-      .toLowerCase()
-      .includes("text/html")
-  ) {
-
-    return upstreamType;
-  }
-
-
-  return "application/octet-stream";
+    "Expires":
+      "0"
+  });
 }
 
 
@@ -2212,22 +2762,19 @@ function detectContentType(
 // MANIFEST DETECTION
 // ============================================================================
 
-function isManifestResponse(
-
+function isManifest(
   url,
-
-  contentType
+  type
 ) {
 
-  const type =
-    String(
-      contentType || ""
-    ).toLowerCase();
+  const lower =
+    String(type || "")
+      .toLowerCase();
 
 
   if (
-    type.includes("mpegurl") ||
-    type.includes("m3u")
+    lower.includes("mpegurl") ||
+    lower.includes("m3u")
   ) {
 
     return true;
@@ -2245,161 +2792,124 @@ function isManifestResponse(
 
   catch {
 
-    return String(url)
-      .toLowerCase()
-      .includes(".m3u8");
+    return false;
   }
 }
 
 
 // ============================================================================
-// LIST ROUTES
+// CONTENT TYPE
 // ============================================================================
 
-async function categoriesRoute() {
-
-  const categories =
-    await getCategories();
-
-
-  return jsonResponse({
-
-    ok:
-      true,
-
-    count:
-      categories.length,
-
-    categories:
-      categories.map(
-
-        (
-          item,
-          index
-        ) => ({
-
-          number:
-            index + 1,
-
-          ...item
-        })
-      )
-  });
-}
-
-
-async function categoryRoute(
-  categoryId
+function mediaContentType(
+  url,
+  upstreamType
 ) {
 
-  const channels =
-    await getCategoryChannels(
-      categoryId
-    );
-
-
-  return jsonResponse({
-
-    ok:
-      true,
-
-    category_id:
-      categoryId,
-
-    count:
-      channels.length,
-
-    channels:
-      channels.map(
-
-        (
-          channel,
-          index
-        ) => ({
-
-          number:
-            index + 1,
-
-          direct:
-            `/c/${channel.id}`,
-
-          live:
-            `/live/${channel.id}.m3u8`,
-
-          ...channel
-        })
-      )
-  });
-}
-
-
-// ============================================================================
-// VALIDATE HTTP URL
-// ============================================================================
-
-function validateHttpUrl(
-  value
-) {
-
-  let parsed;
+  let path = "";
 
 
   try {
 
-    parsed =
-      new URL(
-        value
-      );
+    path =
+      new URL(url)
+        .pathname
+        .toLowerCase();
 
   }
 
   catch {
-
-    throw new Error(
-      "Invalid upstream URL"
-    );
+    //
   }
 
 
   if (
-    parsed.protocol !== "http:" &&
-    parsed.protocol !== "https:"
+    path.endsWith(".ts") ||
+    path.endsWith(".pdf") ||
+    path.endsWith(".js")
   ) {
 
-    throw new Error(
-      "Unsupported upstream protocol"
-    );
+    return "video/mp2t";
   }
 
 
-  return parsed;
+  if (
+    path.endsWith(".m4s") ||
+    path.endsWith(".mp4") ||
+    path.endsWith(".cmfv")
+  ) {
+
+    return "video/mp4";
+  }
+
+
+  if (
+    path.endsWith(".aac")
+  ) {
+
+    return "audio/aac";
+  }
+
+
+  if (
+    upstreamType &&
+    !upstreamType
+      .toLowerCase()
+      .includes("text/html")
+  ) {
+
+    return upstreamType;
+  }
+
+
+  return "application/octet-stream";
 }
 
 
 // ============================================================================
-// HEADER COPY
+// URL
+// ============================================================================
+
+function checkUrl(
+  value
+) {
+
+  const url =
+    new URL(value);
+
+
+  if (
+    url.protocol !== "http:" &&
+    url.protocol !== "https:"
+  ) {
+
+    throw new Error(
+      "Unsupported URL protocol"
+    );
+  }
+
+
+  return url;
+}
+
+
+// ============================================================================
+// COPY HEADER
 // ============================================================================
 
 function copyHeader(
-
   source,
-
-  target,
-
+  destination,
   name
 ) {
 
   const value =
-    source.get(
-      name
-    );
+    source.get(name);
 
 
-  if (
-    value !== null
-  ) {
+  if (value !== null) {
 
-    target.set(
+    destination.set(
       name,
       value
     );
@@ -2411,25 +2921,21 @@ function copyHeader(
 // JSON
 // ============================================================================
 
-function jsonResponse(
-
-  data,
-
+function json(
+  value,
   status = 200
 ) {
 
   return new Response(
 
     JSON.stringify(
-      data,
+      value,
       null,
       2
     ),
 
     {
-
-      status:
-        status,
+      status,
 
       headers: {
 
@@ -2444,15 +2950,12 @@ function jsonResponse(
 }
 
 
-function jsonError(
-
+function errorJson(
   message,
-
   status = 500
 ) {
 
-  return jsonResponse(
-
+  return json(
     {
 
       ok:
@@ -2462,7 +2965,7 @@ function jsonError(
         message,
 
       version:
-        "4.0"
+        "5.0"
     },
 
     status
@@ -2474,7 +2977,7 @@ function jsonError(
 // CORS
 // ============================================================================
 
-function addCors(
+function cors(
   response
 ) {
 
@@ -2504,7 +3007,7 @@ function addCors(
 
   headers.set(
     "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, X-YCN-Version, X-YCN-Channel"
+    "Content-Length, Content-Range, Accept-Ranges, X-YCN-Version, X-YCN-Profile, X-YCN-Sequence"
   );
 
 
@@ -2520,8 +3023,7 @@ function addCors(
       statusText:
         response.statusText,
 
-      headers:
-        headers
+      headers
     }
   );
 }
