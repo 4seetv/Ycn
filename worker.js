@@ -164,11 +164,11 @@ async function resolveChannel(channelId, serverIndex = 0) {
 // ==========================================
 function encodeProxyToken(url, referer, userAgent, swap, type) {
     const data = JSON.stringify({ u: url, r: referer || "", a: userAgent || "", s: swap || {}, t: type });
-    return btoa(unescape(encodeURIComponent(data)));
+    return arrayBufferToBase64(encoder.encode(data));
 }
 
 function decodeProxyToken(token) {
-    return JSON.parse(decodeURIComponent(escape(atob(token))));
+    return JSON.parse(decoder.decode(base64ToArrayBuffer(token)));
 }
 
 function applySwap(uri, swapConfig) {
@@ -221,7 +221,9 @@ export default {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Range, Accept",
+            "Access-Control-Expose-Headers": "Content-Length, Content-Range",
         };
+        
         if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
         try {
@@ -233,7 +235,7 @@ export default {
                 const isRawRequested = url.searchParams.get("raw") === "1";
                 const acceptHeader = request.headers.get("Accept") || "";
 
-                // إذا كان الطلب من متصفح (يريد صفحة ويب)، ولم يطلب البث الخام (?raw=1)
+                // مشغل الويب المُحسن (يظهر أخطاء الشبكة فوراً إن وجدت)
                 if (!isRawRequested && acceptHeader.includes("text/html")) {
                     const streamUrl = `${workerOrigin}/play/${channelId}?raw=1`;
                     const html = `<!DOCTYPE html>
@@ -242,17 +244,30 @@ export default {
                     <meta name="viewport" content="width=device-width, initial-scale=1">
                     <title>Enlil IPTV Web Player</title>
                     <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
-                    <style>body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;} video{width:100%;height:100%;outline:none;}</style>
+                    <style>
+                      body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;} 
+                      video{width:100%;height:100%;outline:none;}
+                      #err{position:absolute;top:20px;color:red;font-weight:bold;z-index:99;background:rgba(0,0,0,0.7);padding:10px;border-radius:8px;display:none;}
+                    </style>
                     </head><body>
+                    <div id="err"></div>
                     <video id="video" controls autoplay playsinline></video>
                     <script>
                       var video = document.getElementById('video');
+                      var errBox = document.getElementById('err');
                       var hlsUrl = '${streamUrl}';
                       if (Hls.isSupported()) {
                         var hls = new Hls({maxMaxBufferLength: 30});
                         hls.loadSource(hlsUrl);
                         hls.attachMedia(video);
                         hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play().catch(e=>{}); });
+                        hls.on(Hls.Events.ERROR, function (event, data) {
+                          if (data.fatal) {
+                            errBox.style.display = 'block';
+                            errBox.innerText = 'خطأ في تشغيل المقطع: ' + data.details;
+                            if(data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+                          }
+                        });
                       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                         video.src = hlsUrl;
                         video.addEventListener('loadedmetadata', function() { video.play().catch(e=>{}); });
@@ -262,7 +277,7 @@ export default {
                     return new Response(html, { headers: { "Content-Type": "text/html;charset=UTF-8", ...corsHeaders }});
                 }
 
-                // النظام القناص (Failover): يفحص السيرفرات ويجلب أول بث شغال مباشرة
+                // النظام القناص (Failover)
                 let serverCount = 8; 
                 for (let i = 0; i < serverCount; i++) {
                     try {
@@ -272,8 +287,7 @@ export default {
                         const userAgent = info.agent || "ExoPlayer/2.18.1 (Linux; Android 13) ExoPlayerLib/2.18.1";
                         const swap = info.swap || {};
 
-                        // اختبار جلب البث للتأكد أنه شغال فعلاً
-                        let fetchHeaders = new Headers({ "User-Agent": userAgent, "Referer": referer });
+                        let fetchHeaders = new Headers({ "User-Agent": userAgent, "Referer": referer, "Origin": new URL(referer).origin });
                         let response = await fetch(targetUrl, { headers: fetchHeaders, redirect: "follow" });
                         
                         if (response.ok) {
@@ -286,19 +300,18 @@ export default {
                                     headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }
                                 });
                             } else {
-                                // بث مباشر بصيغة TS او MP4
                                 return Response.redirect(targetUrl, 302);
                             }
                         }
                     } catch (err) {
-                        continue; // سيرفر معطل، انتقل للذي يليه فوراً
+                        continue;
                     }
                 }
                 return new Response("عذراً، جميع السيرفرات معطلة حالياً.", { status: 502, headers: corsHeaders });
             }
 
             // ----------------------------------------------------
-            // 2. وكيل المقاطع (Segments Proxy)
+            // 2. وكيل المقاطع (Segments Proxy) وإجبار الصيغة الصحيحة
             // ----------------------------------------------------
             if (path === "/proxy") {
                 const token = url.searchParams.get("t");
@@ -306,11 +319,14 @@ export default {
 
                 const proxyData = decodeProxyToken(token);
                 const targetUrl = proxyData.u;
-                const type = proxyData.t; // 'm' للقوائم, 's' للمقاطع
+                const type = proxyData.t; 
                 
                 const fetchHeaders = new Headers();
                 fetchHeaders.set("User-Agent", proxyData.a);
-                fetchHeaders.set("Referer", proxyData.r);
+                if (proxyData.r) {
+                    fetchHeaders.set("Referer", proxyData.r);
+                    fetchHeaders.set("Origin", new URL(proxyData.r).origin);
+                }
                 if (request.headers.has("Range")) fetchHeaders.set("Range", request.headers.get("Range"));
 
                 const response = await fetch(targetUrl, { method: request.method, headers: fetchHeaders, redirect: "follow" });
@@ -321,11 +337,21 @@ export default {
                     return new Response(rewritten, { status: 200, headers: { ...corsHeaders, "Content-Type": "application/vnd.apple.mpegurl" }});
                 }
 
-                // للمقاطع (Segments): تمرير الفيديو مباشرة
+                // للمقاطع: إجبار الصيغة الصحيحة لتشغيل ملفات الـ .js الوهمية كفيديو
                 const newHeaders = new Headers(response.headers);
                 newHeaders.set("Access-Control-Allow-Origin", "*");
+                newHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+                newHeaders.set("Access-Control-Allow-Headers", "Content-Type, Range, Accept");
+                newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range");
                 newHeaders.delete("content-encoding");
                 newHeaders.delete("transfer-encoding");
+
+                let pathLower = targetUrl.toLowerCase();
+                if (pathLower.includes(".js") || pathLower.includes(".ts")) {
+                    newHeaders.set("Content-Type", "video/mp2t"); // تحويل الـ JS إلى فيديو
+                } else if (pathLower.includes(".m4s")) {
+                    newHeaders.set("Content-Type", "video/iso.segment");
+                }
 
                 return new Response(response.body, { status: response.status, headers: newHeaders });
             }
