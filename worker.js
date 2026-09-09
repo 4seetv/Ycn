@@ -1,13 +1,11 @@
-import CryptoJS from 'https://esm.sh/crypto-js@4.1.1';
-
 // ==========================================
 // الإعدادات والثوابت
 // ==========================================
 const LIVE_API_BASE = "http://live.sepdatabridge.site/api/live/livedrama/v13.0.0";
 const REDIRECT_API_BASE = "http://redirect.sepdatabridge.site/redirect";
 
-const AES_KEY = CryptoJS.enc.Utf8.parse('0123456789abcdef');
-const AES_IV = CryptoJS.enc.Utf8.parse('fedcba9876543210');
+const AES_KEY_STRING = '0123456789abcdef';
+const AES_IV_STRING = 'fedcba9876543210';
 const IV_BASE64 = 'ZmVkY2JhOTg3NjU0MzIxMA==';
 
 const API_HEADERS = {
@@ -18,28 +16,73 @@ const API_HEADERS = {
 };
 
 // ==========================================
-// دوال التشفير الخاصة بـ Drama Live
+// دوال التشفير المدمجة (Native Web Crypto API)
 // ==========================================
-function encryptPayload(jsonData) {
-    const jsonString = JSON.stringify(jsonData);
-    const encrypted = CryptoJS.AES.encrypt(jsonString, AES_KEY, {
-        iv: AES_IV,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7
-    });
-    return encrypted.toString() + ':' + IV_BASE64;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+async function getCryptoKey() {
+    return await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(AES_KEY_STRING),
+        { name: "AES-CBC", length: 128 },
+        false,
+        ["encrypt", "decrypt"]
+    );
 }
 
-function decryptPayload(encryptedText) {
-    const ciphertext = encryptedText.split(':')[0];
-    const decrypted = CryptoJS.AES.decrypt(ciphertext, AES_KEY, {
-        iv: AES_IV,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7
-    });
-    return JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
+// أدوات مساعدة للتعامل مع Base64
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    let bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
 }
 
+function base64ToArrayBuffer(base64) {
+    let binary_string = atob(base64);
+    let len = binary_string.length;
+    let bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binary_string.charCodeAt(i);
+    }
+    return bytes;
+}
+
+async function encryptPayload(jsonData) {
+    const key = await getCryptoKey();
+    const iv = encoder.encode(AES_IV_STRING);
+    const data = encoder.encode(JSON.stringify(jsonData));
+
+    const encryptedBuffer = await crypto.subtle.encrypt(
+        { name: "AES-CBC", iv: iv },
+        key,
+        data
+    );
+
+    return arrayBufferToBase64(encryptedBuffer) + ':' + IV_BASE64;
+}
+
+async function decryptPayload(encryptedText) {
+    const ciphertextBase64 = encryptedText.split(':')[0];
+    const key = await getCryptoKey();
+    const iv = encoder.encode(AES_IV_STRING);
+    const bytes = base64ToArrayBuffer(ciphertextBase64);
+
+    const decryptedBuffer = await crypto.subtle.decrypt(
+        { name: "AES-CBC", iv: iv },
+        key,
+        bytes
+    );
+
+    return JSON.parse(decoder.decode(decryptedBuffer));
+}
+
+// ==========================================
+// بناء الطلبات وتخطي الحماية
+// ==========================================
 function commonPayload() {
     return {
         "user_id": `_41810_${Date.now()}_notloggedin.com_dramalive3`,
@@ -61,7 +104,7 @@ function commonPayload() {
 }
 
 async function encryptedPost(url, data) {
-    const body = encryptPayload(data);
+    const body = await encryptPayload(data);
     const response = await fetch(url, {
         method: 'POST',
         headers: API_HEADERS,
@@ -69,14 +112,13 @@ async function encryptedPost(url, data) {
     });
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
     const text = await response.text();
-    return decryptPayload(text);
+    return await decryptPayload(text);
 }
 
 // ==========================================
 // دوال جلب السيرفرات والتوجيه (Resolver)
 // ==========================================
 async function resolveChannel(channelId, serverIndex = 0) {
-    // 1. جلب كل سيرفرات القناة
     const payload = commonPayload();
     payload.id = channelId;
     const streamInfo = await encryptedPost(`${LIVE_API_BASE}/getLiveAllStreamsById`, payload);
@@ -103,7 +145,6 @@ async function resolveChannel(channelId, serverIndex = 0) {
 
     let resolved = { url: source, agent: "", headers: {}, swap: {} };
 
-    // 2. حل التوجيه المزدوج (Double Redirect)
     if (["redirect", "double_redirect", "all_streams_redirect"].includes(resolverAgent)) {
         let rPayload = commonPayload();
         rPayload.id = channelId;
@@ -119,7 +160,6 @@ async function resolveChannel(channelId, serverIndex = 0) {
         let nextUrl = nested.url;
         let nextAgent = nested.agent || rData.data?.agent || "redirect";
 
-        // تخطي إضافي إذا كان السيرفر يحتاج توجيه ثاني
         if (resolverAgent === "double_redirect" && nextUrl) {
             let rPayload2 = commonPayload();
             rPayload2.id = channelId;
@@ -150,7 +190,6 @@ async function resolveChannel(channelId, serverIndex = 0) {
         } catch(e) {}
     }
 
-    // تنظيف الروابط الوهمية
     if (!resolved.url.startsWith('http')) {
         throw new Error("رابط وهمي أو مشفر، يجب التخطي");
     }
@@ -163,11 +202,11 @@ async function resolveChannel(channelId, serverIndex = 0) {
 // ==========================================
 function encodeProxyToken(url, referer, userAgent, swap) {
     const data = JSON.stringify({ u: url, r: referer, a: userAgent, s: swap });
-    return btoa(unescape(encodeURIComponent(data)));
+    return arrayBufferToBase64(encoder.encode(data));
 }
 
 function decodeProxyToken(token) {
-    return JSON.parse(decodeURIComponent(escape(atob(token))));
+    return JSON.parse(decoder.decode(base64ToArrayBuffer(token)));
 }
 
 function applySwap(uri, swapConfig) {
@@ -189,7 +228,6 @@ export default {
         const path = url.pathname;
         const workerOrigin = url.origin;
 
-        // إعدادات CORS
         const corsHeaders = {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -203,7 +241,7 @@ export default {
             // ----------------------------------------------------
             if (path.startsWith("/play/")) {
                 const channelId = path.split("/")[2];
-                let serverCount = 8; // جرب أول 8 سيرفرات كحد أقصى للتخطي
+                let serverCount = 8; 
                 
                 for (let i = 0; i < serverCount; i++) {
                     try {
@@ -213,15 +251,12 @@ export default {
                         const userAgent = info.agent || "ExoPlayer/2.18.1 (Linux; Android 13) ExoPlayerLib/2.18.1";
                         const swap = info.swap || {};
 
-                        // تكوين توكن لا يحفظ حالة (Stateless)
                         const token = encodeProxyToken(targetUrl, referer, userAgent, swap);
                         const proxyUrl = `${workerOrigin}/proxy?t=${encodeURIComponent(token)}`;
                         
-                        // إعادة التوجيه الفوري للبروكسي ليبدأ معالجة الـ M3U8/MPD
                         return Response.redirect(proxyUrl, 302);
                     } catch (err) {
-                        // فشل السيرفر (رابط وهمي، HTML)، جرب الذي يليه بصمت
-                        continue;
+                        continue; // فشل السيرفر، جرب الذي يليه
                     }
                 }
                 return new Response("All servers failed or blocked.", { status: 502, headers: corsHeaders });
@@ -237,7 +272,6 @@ export default {
                 const proxyData = decodeProxyToken(token);
                 const targetUrl = proxyData.u;
                 
-                // بناء الترويسات المطلوبة لتخطي الحماية
                 const fetchHeaders = new Headers();
                 fetchHeaders.set("User-Agent", proxyData.a);
                 fetchHeaders.set("Referer", proxyData.r);
@@ -250,7 +284,7 @@ export default {
                 });
 
                 const contentType = response.headers.get("content-type") || "";
-                const responseUrl = response.url; // الرابط بعد الـ Redirects
+                const responseUrl = response.url; 
 
                 // إذا كان الملف عبارة عن قائمة تشغيل (HLS/DASH)، أعد كتابته
                 if (contentType.includes("mpegurl") || targetUrl.includes(".m3u8") || contentType.includes("dash+xml") || targetUrl.includes(".mpd")) {
@@ -258,12 +292,10 @@ export default {
                     const baseUrl = new URL(".", responseUrl).href;
 
                     if (manifestText.includes("#EXTM3U")) {
-                        // إعادة كتابة HLS (M3U8)
                         let rewrittenManifest = manifestText.split('\n').map(line => {
                             let trimmed = line.trim();
                             if (!trimmed) return "";
                             if (trimmed.startsWith("#")) {
-                                // معالجة الروابط داخل الترويسات مثل URI="..."
                                 return trimmed.replace(/URI="(.*?)"/g, (match, uri) => {
                                     let swappedUri = applySwap(uri, proxyData.s);
                                     let absoluteUrl = new URL(swappedUri, baseUrl).href;
@@ -271,7 +303,6 @@ export default {
                                     return `URI="${workerOrigin}/proxy?t=${encodeURIComponent(newToken)}"`;
                                 });
                             }
-                            // معالجة روابط الـ Segments المباشرة
                             let swappedUri = applySwap(trimmed, proxyData.s);
                             let absoluteUrl = new URL(swappedUri, baseUrl).href;
                             let newToken = encodeProxyToken(absoluteUrl, proxyData.r, proxyData.a, proxyData.s);
@@ -284,7 +315,6 @@ export default {
                         });
                     } 
                     else if (manifestText.includes("<MPD")) {
-                        // إعادة كتابة DASH (MPD)
                         let rewrittenManifest = manifestText.replace(/(BaseURL|media|initialization|sourceURL)=["'](.*?)["']/g, (match, attr, uri) => {
                             if (!uri.startsWith("http")) uri = new URL(uri, baseUrl).href;
                             let newToken = encodeProxyToken(uri, proxyData.r, proxyData.a, proxyData.s);
@@ -298,10 +328,9 @@ export default {
                     }
                 }
 
-                // إذا كان المحتوى مقطع فيديو (TS, M4S, MP4)، قم بتمريره مباشرة كمجرى (Stream)
+                // تمرير المقطع المباشر للـ VLC أو المشغل
                 const newHeaders = new Headers(response.headers);
                 newHeaders.set("Access-Control-Allow-Origin", "*");
-                // حذف الترويسات التي تسبب تعارض
                 newHeaders.delete("content-encoding");
                 newHeaders.delete("transfer-encoding");
 
@@ -311,7 +340,7 @@ export default {
                 });
             }
 
-            return new Response("Drama Live Middleware Worker Running.", { status: 200 });
+            return new Response("Drama Live Middleware Worker is Online.", { status: 200 });
 
         } catch (error) {
             return new Response(error.message, { status: 500, headers: corsHeaders });
