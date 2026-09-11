@@ -1,27 +1,27 @@
 // ============================================================================
-// YCN 24/7 HLS GATEWAY
-// Cloudflare Worker - Single File
+// YCN HIGH-SCALE LIVE HLS GATEWAY
+// Cloudflare Worker - SINGLE FILE
 //
-// VERSION 5.0 - TIMELINE LOCK
+// VERSION: 6.0 SCALE EDITION
 //
-// Fixes:
-// 1. Prevents switching between different live timelines
-//    e.g. 108xx/.pdf/4s <-> 72xx/.js/6s
+// Goals:
+// - Designed for hundreds / thousands of concurrent viewers
+// - Shared live manifest refresh
+// - Timeline locking
+// - MEDIA-SEQUENCE rollback protection
+// - Shared segment caching
+// - Range support from cached full objects
+// - Upstream request coalescing (anti-thundering-herd)
+// - Segment retries
+// - Alternative CDN-host recovery
+// - API/playback info caching
+// - AES/key/resource caching
+// - No unsupported fetch({ cache: ... })
+// - Base64 + XOR API decoding
 //
-// 2. Locks one HLS profile per channel session.
-//
-// 3. MEDIA-SEQUENCE is prevented from moving backwards.
-//
-// 4. Segment timeout/failure recovery:
-//    re-fetches the SAME locked playlist and searches for the same segment
-//    on another upstream host.
-//
-// 5. Fresh API playback URL is NOT requested on every playlist reload.
-//
-// 6. Token refresh only near real expiration or if root playlist fails.
-//
-// 7. No unsupported fetch({ cache: ... }) option.
-//
+// IMPORTANT:
+// Cache API is local to each Cloudflare data center.
+// Different PoPs build their own hot cache.
 // ============================================================================
 
 
@@ -37,7 +37,7 @@ const CONFIG = {
   STATIC_KEY:
     "c!xZj+N9&G@Ev@vw",
 
-  API_USER_AGENT:
+  API_UA:
     "okhttp/4.12.0",
 
   DEFAULT_REFERER:
@@ -48,52 +48,132 @@ const CONFIG = {
     "AppleWebKit/537.36 (KHTML, like Gecko) " +
     "Chrome/139.0.0.0 Safari/537.36",
 
-  DEFAULT_CATEGORY_ID:
+  DEFAULT_CATEGORY:
     4,
 
-  // Number of manifest samples used to avoid a rotating upstream timeline.
-  MANIFEST_SAMPLES:
-    3,
 
-  // When a segment host hangs, abort it before the player buffer is exhausted.
-  SEGMENT_TIMEOUT_MS:
-    5500,
+  // --------------------------------------------------------------------------
+  // SHARING / SCALE
+  // --------------------------------------------------------------------------
 
-  MANIFEST_TIMEOUT_MS:
-    6000,
+  // All viewers at the same edge can reuse the same rewritten playlist
+  // for a very short period.
+  LIVE_MANIFEST_TTL:
+    1,
+
+  // Playback API information does not need to be requested by every viewer.
+  PLAYBACK_TTL:
+    45,
+
+  CATEGORY_TTL:
+    300,
+
+  // Live segments are immutable once generated.
+  SEGMENT_CACHE_TTL:
+    180,
+
+  // AES keys / auxiliary small resources:
+  GENERIC_RESOURCE_TTL:
+    15,
+
+  LOCK_TTL:
+    21600,
+
+
+  // --------------------------------------------------------------------------
+  // TIMEOUTS
+  // --------------------------------------------------------------------------
 
   API_TIMEOUT_MS:
     7000,
 
-  // Refresh hours-long token before it actually expires.
-  TOKEN_REFRESH_MARGIN_SECONDS:
+  MANIFEST_TIMEOUT_MS:
+    5000,
+
+  SEGMENT_TIMEOUT_MS:
+    6500,
+
+  GENERIC_TIMEOUT_MS:
+    6500,
+
+
+  // --------------------------------------------------------------------------
+  // RETRIES
+  // --------------------------------------------------------------------------
+
+  MANIFEST_ATTEMPTS:
+    4,
+
+  INITIAL_PROFILE_SAMPLES:
+    4,
+
+  SEGMENT_ATTEMPTS:
+    3,
+
+  ALTERNATIVE_LOOKUPS:
+    2,
+
+
+  // --------------------------------------------------------------------------
+  // TOKEN
+  // --------------------------------------------------------------------------
+
+  TOKEN_REFRESH_MARGIN:
     120,
 
-  // Session state stored at Cloudflare edge.
-  SESSION_TTL_SECONDS:
-    21600,
 
-  CORS_ORIGIN:
+  // --------------------------------------------------------------------------
+  // CORS
+  // --------------------------------------------------------------------------
+
+  CORS:
     "*"
 };
 
 
 // ============================================================================
-// MAIN
+// IN-MEMORY L1
+//
+// These are per Worker isolate.
+// Cache API below acts as L2 per Cloudflare data center.
+// ============================================================================
+
+const L1_MANIFEST =
+  new Map();
+
+const L1_PLAYBACK =
+  new Map();
+
+const INFLIGHT =
+  new Map();
+
+
+// ============================================================================
+// ENTRY
 // ============================================================================
 
 export default {
 
-  async fetch(request) {
+  async fetch(
+    request,
+    env,
+    ctx
+  ) {
 
     try {
 
-      if (request.method === "OPTIONS") {
+      if (
+        request.method ===
+        "OPTIONS"
+      ) {
 
         return cors(
-          new Response(null, {
-            status: 204
-          })
+          new Response(
+            null,
+            {
+              status: 204
+            }
+          )
         );
       }
 
@@ -113,7 +193,9 @@ export default {
 
 
       const url =
-        new URL(request.url);
+        new URL(
+          request.url
+        );
 
 
       const path =
@@ -134,10 +216,13 @@ export default {
             ok: true,
 
             service:
-              "YCN 24/7 Timeline Lock Gateway",
+              "YCN High Scale Gateway",
 
             version:
-              "5.0",
+              "6.0",
+
+            mode:
+              "shared-manifest + timeline-lock + segment-cache",
 
             routes: {
 
@@ -146,6 +231,9 @@ export default {
 
               category:
                 "/category/4",
+
+              numeric:
+                "/1",
 
               channel:
                 "/c/1424",
@@ -162,7 +250,10 @@ export default {
       // CATEGORIES
       // ======================================================================
 
-      if (path === "categories") {
+      if (
+        path ===
+        "categories"
+      ) {
 
         const categories =
           await getCategories();
@@ -176,8 +267,7 @@ export default {
             count:
               categories.length,
 
-            categories:
-              categories
+            categories
           })
         );
       }
@@ -188,10 +278,12 @@ export default {
       // ======================================================================
 
       if (
-        path.startsWith("category/")
+        path.startsWith(
+          "category/"
+        )
       ) {
 
-        const id =
+        const categoryId =
           path.substring(
             "category/".length
           );
@@ -199,7 +291,7 @@ export default {
 
         const channels =
           await getCategoryChannels(
-            id
+            categoryId
           );
 
 
@@ -209,14 +301,17 @@ export default {
             ok: true,
 
             category_id:
-              id,
+              categoryId,
 
             count:
               channels.length,
 
             channels:
               channels.map(
-                (channel, index) => ({
+                (
+                  channel,
+                  index
+                ) => ({
 
                   number:
                     index + 1,
@@ -236,30 +331,26 @@ export default {
 
 
       // ======================================================================
-      // /c/1424
+      // /c/{channel}
       // ======================================================================
 
       if (
-        path.startsWith("c/")
+        path.startsWith(
+          "c/"
+        )
       ) {
 
         let channelId =
-          path.substring(2)
-            .replace(
-              /\.m3u8$/i,
-              ""
-            );
-
-
-        if (!channelId) {
-
-          return cors(
-            errorJson(
-              "Missing channel ID",
-              400
-            )
+          path.substring(
+            2
           );
-        }
+
+
+        channelId =
+          channelId.replace(
+            /\.m3u8$/i,
+            ""
+          );
 
 
         return Response.redirect(
@@ -272,14 +363,13 @@ export default {
 
 
       // ======================================================================
-      // STABLE LIVE ENTRY
-      //
-      // /live/1424.m3u8
-      //
+      // /live/{channel}.m3u8
       // ======================================================================
 
       if (
-        path.startsWith("live/")
+        path.startsWith(
+          "live/"
+        )
       ) {
 
         let channelId =
@@ -306,64 +396,36 @@ export default {
         }
 
 
-        return await liveEntry(
+        return await liveRoute(
+
           request,
+
           channelId
         );
       }
 
 
       // ======================================================================
-      // LOCKED SESSION
+      // INTERNAL RESOURCE
       // ======================================================================
 
       if (
-        path.startsWith("_session/")
+        path === "_r"
       ) {
 
-        const parts =
-          path.split("/");
-
-
-        const sid =
-          parts[1];
-
-
-        if (!sid) {
-
-          return cors(
-            errorJson(
-              "Missing session ID",
-              400
-            )
-          );
-        }
-
-
-        return await lockedManifest(
-          request,
-          sid
-        );
-      }
-
-
-      // ======================================================================
-      // RESOURCE
-      // ======================================================================
-
-      if (path === "_resource") {
-
-        return await proxyResource(
+        return await resourceRoute(
           request
         );
       }
 
 
       // ======================================================================
-      // /1 /2 /3...
+      // /1 /2 /3 ...
       // ======================================================================
 
-      if (/^\d+$/.test(path)) {
+      if (
+        /^\d+$/.test(path)
+      ) {
 
         const number =
           Number(path);
@@ -371,7 +433,7 @@ export default {
 
         const channels =
           await getCategoryChannels(
-            CONFIG.DEFAULT_CATEGORY_ID
+            CONFIG.DEFAULT_CATEGORY
           );
 
 
@@ -415,11 +477,17 @@ export default {
 
     catch (error) {
 
+      console.log(
+        "WORKER ERROR:",
+        error?.message ||
+        String(error)
+      );
+
+
       return cors(
         errorJson(
           error?.message ||
           String(error),
-
           500
         )
       );
@@ -429,827 +497,38 @@ export default {
 
 
 // ============================================================================
-// API
+// LIVE ROUTE
 // ============================================================================
 
-async function apiFetch(
-  endpoint
-) {
-
-  const url =
-    `${CONFIG.API_BASE}/${String(endpoint).replace(/^\/+/, "")}`;
-
-
-  const headers =
-    new Headers();
-
-
-  headers.set(
-    "User-Agent",
-    CONFIG.API_USER_AGENT
-  );
-
-
-  headers.set(
-    "Accept",
-    "application/json"
-  );
-
-
-  headers.set(
-    "Cache-Control",
-    "no-cache"
-  );
-
-
-  const response =
-    await timedFetch(
-
-      url,
-
-      {
-        method: "GET",
-        headers,
-        redirect: "follow"
-      },
-
-      CONFIG.API_TIMEOUT_MS
-    );
-
-
-  if (!response.ok) {
-
-    throw new Error(
-      `API HTTP ${response.status}`
-    );
-  }
-
-
-  const t =
-    response.headers.get("t") || "";
-
-
-  if (!t) {
-
-    throw new Error(
-      "Missing API t header"
-    );
-  }
-
-
-  const body =
-    (await response.text())
-      .trim();
-
-
-  return decryptApi(
-    body,
-    t
-  );
-}
-
-
-// ============================================================================
-// DECRYPT
-// ============================================================================
-
-function decryptApi(
-  encrypted,
-  t
-) {
-
-  let binary;
-
-
-  try {
-
-    binary =
-      atob(encrypted);
-
-  }
-
-  catch {
-
-    throw new Error(
-      "Invalid Base64 response"
-    );
-  }
-
-
-  const input =
-    new Uint8Array(
-      binary.length
-    );
-
-
-  for (
-    let i = 0;
-    i < binary.length;
-    i++
-  ) {
-
-    input[i] =
-      binary.charCodeAt(i);
-  }
-
-
-  const key =
-    new TextEncoder()
-      .encode(
-        CONFIG.STATIC_KEY +
-        String(t)
-      );
-
-
-  const output =
-    new Uint8Array(
-      input.length
-    );
-
-
-  for (
-    let i = 0;
-    i < input.length;
-    i++
-  ) {
-
-    output[i] =
-      input[i] ^
-      key[
-        i % key.length
-      ];
-  }
-
-
-  const text =
-    new TextDecoder()
-      .decode(output);
-
-
-  try {
-
-    return JSON.parse(
-      text
-    );
-
-  }
-
-  catch {
-
-    throw new Error(
-      "Invalid decrypted JSON"
-    );
-  }
-}
-
-
-// ============================================================================
-// DATA NORMALIZATION
-// ============================================================================
-
-function normalize(
-  payload
-) {
-
-  if (
-    payload &&
-    typeof payload === "object" &&
-    Object.prototype.hasOwnProperty.call(
-      payload,
-      "data"
-    )
-  ) {
-
-    return payload.data;
-  }
-
-
-  return payload;
-}
-
-
-// ============================================================================
-// CATEGORIES
-// ============================================================================
-
-async function getCategories() {
-
-  const data =
-    normalize(
-      await apiFetch(
-        "categories"
-      )
-    );
-
-
-  if (!Array.isArray(data)) {
-
-    throw new Error(
-      "Invalid categories response"
-    );
-  }
-
-
-  return data;
-}
-
-
-// ============================================================================
-// CHANNELS
-// ============================================================================
-
-async function getCategoryChannels(
-  categoryId
-) {
-
-  const data =
-    normalize(
-      await apiFetch(
-
-        `categories/${encodeURIComponent(categoryId)}/channels`
-      )
-    );
-
-
-  if (!Array.isArray(data)) {
-
-    throw new Error(
-      "Invalid channels response"
-    );
-  }
-
-
-  return data;
-}
-
-
-// ============================================================================
-// PLAYBACK INFO
-// ============================================================================
-
-async function getChannelStream(
-  channelId
-) {
-
-  let data =
-    normalize(
-      await apiFetch(
-
-        `channel/${encodeURIComponent(channelId)}`
-      )
-    );
-
-
-  if (Array.isArray(data)) {
-
-    if (!data.length) {
-
-      throw new Error(
-        "No playback servers"
-      );
-    }
-
-
-    data =
-      data.find(
-        item =>
-          item &&
-          (
-            item.url ||
-            item.stream_url ||
-            item.link
-          )
-      ) || data[0];
-  }
-
-
-  if (
-    !data ||
-    typeof data !== "object"
-  ) {
-
-    throw new Error(
-      "Invalid playback data"
-    );
-  }
-
-
-  const streamUrl =
-    data.url ||
-    data.stream_url ||
-    data.link;
-
-
-  if (!streamUrl) {
-
-    throw new Error(
-      "Missing stream URL"
-    );
-  }
-
-
-  checkUrl(
-    streamUrl
-  );
-
-
-  return {
-
-    channelId:
-      String(channelId),
-
-    url:
-      streamUrl,
-
-    referer:
-
-      data.referer ||
-
-      data.headers?.Referer ||
-
-      CONFIG.DEFAULT_REFERER,
-
-    userAgent:
-
-      data.user_agent ||
-
-      data.headers?.["User-Agent"] ||
-
-      CONFIG.DEFAULT_PLAYER_UA
-  };
-}
-
-
-// ============================================================================
-// LIVE ENTRY
-// ============================================================================
-
-async function liveEntry(
+async function liveRoute(
   request,
   channelId
 ) {
 
-  // Try to reuse the SAME session for repeated /live requests.
-  const currentSid =
-    await getDefaultSessionId(
+  const item =
+    await getSharedManifest(
       channelId
     );
-
-
-  if (currentSid) {
-
-    const existing =
-      await loadSession(
-        currentSid
-      );
-
-
-    if (
-      existing &&
-      existing.channelId ===
-        String(channelId)
-    ) {
-
-      return Response.redirect(
-
-        new URL(request.url).origin +
-        `/_session/${currentSid}.m3u8`,
-
-        302
-      );
-    }
-  }
-
-
-  // ========================================================================
-  // CREATE NEW LOCKED TIMELINE
-  // ========================================================================
-
-  const stream =
-    await getChannelStream(
-      channelId
-    );
-
-
-  const initial =
-    await selectInitialTimeline(
-      request,
-      stream
-    );
-
-
-  const sid =
-    crypto.randomUUID();
-
-
-  const state = {
-
-    sid,
-
-    channelId:
-      String(channelId),
-
-    upstreamUrl:
-      stream.url,
-
-    referer:
-      stream.referer,
-
-    userAgent:
-      stream.userAgent,
-
-    profile:
-      initial.profile,
-
-    lastSequence:
-      initial.sequence,
-
-    lastManifest:
-      initial.text,
-
-    lastManifestUrl:
-      initial.finalUrl,
-
-    created:
-      Date.now()
-  };
-
-
-  await saveSession(
-    state
-  );
-
-
-  await saveDefaultSession(
-    channelId,
-    sid
-  );
-
-
-  return Response.redirect(
-
-    new URL(request.url).origin +
-    `/_session/${sid}.m3u8`,
-
-    302
-  );
-}
-
-
-// ============================================================================
-// INITIAL TIMELINE SELECTION
-// ============================================================================
-
-async function selectInitialTimeline(
-  request,
-  stream
-) {
-
-  const candidates = [];
-
-
-  for (
-    let i = 0;
-    i < CONFIG.MANIFEST_SAMPLES;
-    i++
-  ) {
-
-    try {
-
-      const item =
-        await fetchManifestCandidate(
-
-          request,
-
-          stream.url,
-
-          stream.referer,
-
-          stream.userAgent
-        );
-
-
-      candidates.push(
-        item
-      );
-
-    }
-
-    catch {
-      // Try another sample.
-    }
-  }
-
-
-  if (!candidates.length) {
-
-    throw new Error(
-      "Unable to obtain HLS playlist"
-    );
-  }
-
-
-  // ========================================================================
-  // GROUP BY TIMELINE PROFILE
-  //
-  // Example:
-  //
-  // 4|pdf
-  // 6|js
-  //
-  // ========================================================================
-
-  const groups =
-    new Map();
-
-
-  for (
-    const item of candidates
-  ) {
-
-    if (
-      !groups.has(
-        item.profile
-      )
-    ) {
-
-      groups.set(
-        item.profile,
-        []
-      );
-    }
-
-
-    groups.get(
-      item.profile
-    ).push(
-      item
-    );
-  }
-
-
-  let selectedGroup =
-    null;
-
-
-  for (
-    const group
-    of groups.values()
-  ) {
-
-    if (
-      !selectedGroup ||
-      group.length >
-        selectedGroup.length
-    ) {
-
-      selectedGroup =
-        group;
-    }
-
-    else if (
-      group.length ===
-        selectedGroup.length
-    ) {
-
-      // In a tie prefer shorter target duration.
-      const a =
-        group[0].targetDuration || 999;
-
-
-      const b =
-        selectedGroup[0]
-          .targetDuration || 999;
-
-
-      if (a < b) {
-
-        selectedGroup =
-          group;
-      }
-    }
-  }
-
-
-  // Choose freshest sequence from selected timeline.
-  selectedGroup.sort(
-    (a, b) =>
-      b.sequence -
-      a.sequence
-  );
-
-
-  return selectedGroup[0];
-}
-
-
-// ============================================================================
-// LOCKED MANIFEST
-// ============================================================================
-
-async function lockedManifest(
-  request,
-  sidPath
-) {
-
-  const sid =
-    sidPath.replace(
-      /\.m3u8$/i,
-      ""
-    );
-
-
-  let state =
-    await loadSession(
-      sid
-    );
-
-
-  if (!state) {
-
-    return cors(
-      errorJson(
-        "Session expired. Reopen /live/{channel}.m3u8",
-        410
-      )
-    );
-  }
-
-
-  // ========================================================================
-  // REAL TOKEN EXPIRY
-  // ========================================================================
-
-  if (
-    tokenNearExpiry(
-      state.upstreamUrl
-    )
-  ) {
-
-    state =
-      await renewLockedRoot(
-        request,
-        state
-      );
-  }
-
-
-  let best =
-    null;
-
-
-  // ========================================================================
-  // SAMPLE SAME ROOT BUT ACCEPT ONLY LOCKED PROFILE
-  // ========================================================================
-
-  for (
-    let i = 0;
-    i < CONFIG.MANIFEST_SAMPLES;
-    i++
-  ) {
-
-    try {
-
-      const candidate =
-        await fetchManifestCandidate(
-
-          request,
-
-          state.upstreamUrl,
-
-          state.referer,
-
-          state.userAgent
-        );
-
-
-      if (
-        candidate.profile !==
-        state.profile
-      ) {
-
-        // Critical:
-        // upstream returned another timeline.
-        // Ignore it completely.
-        continue;
-      }
-
-
-      if (
-        !best ||
-        candidate.sequence >
-          best.sequence
-      ) {
-
-        best =
-          candidate;
-      }
-
-    }
-
-    catch {
-      // Next sample.
-    }
-  }
-
-
-  // ========================================================================
-  // ROOT FAILED OR PROFILE DISAPPEARED
-  // ========================================================================
-
-  if (!best) {
-
-    state =
-      await renewLockedRoot(
-        request,
-        state
-      );
-
-
-    best =
-      await findLockedCandidate(
-        request,
-        state
-      );
-  }
-
-
-  // ========================================================================
-  // NEVER GO BACKWARDS
-  // ========================================================================
-
-  if (
-    best.sequence <
-      state.lastSequence &&
-    state.lastManifest
-  ) {
-
-    best = {
-
-      text:
-        state.lastManifest,
-
-      finalUrl:
-        state.lastManifestUrl,
-
-      sequence:
-        state.lastSequence,
-
-      profile:
-        state.profile,
-
-      targetDuration:
-        getTargetDuration(
-          state.lastManifest
-        )
-    };
-  }
-
-
-  // ========================================================================
-  // SAVE NEW FORWARD STATE
-  // ========================================================================
-
-  if (
-    best.sequence >=
-    state.lastSequence
-  ) {
-
-    state.lastSequence =
-      best.sequence;
-
-
-    state.lastManifest =
-      best.text;
-
-
-    state.lastManifestUrl =
-      best.finalUrl;
-
-
-    await saveSession(
-      state
-    );
-  }
 
 
   const origin =
-    new URL(request.url)
-      .origin;
+    new URL(
+      request.url
+    ).origin;
 
 
   const rewritten =
-    rewriteManifest(
+    await rewriteManifest(
 
-      best.text,
+      item.text,
 
-      best.finalUrl,
+      item.finalUrl,
 
       origin,
 
-      sid,
+      channelId,
 
-      state
+      item.profile
     );
 
 
@@ -1259,26 +538,33 @@ async function lockedManifest(
 
   headers.set(
     "X-YCN-Version",
-    "5.0"
+    "6.0"
   );
 
 
   headers.set(
     "X-YCN-Profile",
-    state.profile
+    item.profile
   );
 
 
   headers.set(
     "X-YCN-Sequence",
     String(
-      state.lastSequence
+      item.sequence
     )
   );
 
 
+  headers.set(
+    "X-YCN-Shared",
+    "1"
+  );
+
+
   if (
-    request.method === "HEAD"
+    request.method ===
+    "HEAD"
   ) {
 
     return cors(
@@ -1306,42 +592,338 @@ async function lockedManifest(
 
 
 // ============================================================================
-// FIND CANDIDATE MATCHING LOCK
+// SHARED LIVE MANIFEST
 // ============================================================================
 
-async function findLockedCandidate(
-  request,
-  state
+async function getSharedManifest(
+  channelId,
+  force = false
 ) {
+
+  const now =
+    Date.now();
+
+
+  // --------------------------------------------------------------------------
+  // L1
+  // --------------------------------------------------------------------------
+
+  if (!force) {
+
+    const l1 =
+      L1_MANIFEST.get(
+        channelId
+      );
+
+
+    if (
+      l1 &&
+      l1.expires >
+      now
+    ) {
+
+      return l1.value;
+    }
+  }
+
+
+  const cacheKey =
+    internalRequest(
+      `manifest/${channelId}`
+    );
+
+
+  // --------------------------------------------------------------------------
+  // EDGE CACHE
+  // --------------------------------------------------------------------------
+
+  if (!force) {
+
+    try {
+
+      const cached =
+        await caches.default.match(
+          cacheKey
+        );
+
+
+      if (cached) {
+
+        const value =
+          await cached.json();
+
+
+        L1_MANIFEST.set(
+          channelId,
+          {
+
+            expires:
+              now + 900,
+
+            value
+          }
+        );
+
+
+        return value;
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  // --------------------------------------------------------------------------
+  // REQUEST COALESCING
+  //
+  // 100 viewers hitting at the same millisecond should not create
+  // 100 upstream manifest requests inside the same isolate.
+  // --------------------------------------------------------------------------
+
+  return await dedupe(
+
+    `manifest:${channelId}`,
+
+    async () => {
+
+      // Recheck cache after waiting for another request.
+      if (!force) {
+
+        try {
+
+          const again =
+            await caches.default.match(
+              cacheKey
+            );
+
+
+          if (again) {
+
+            return await again.json();
+          }
+
+        }
+
+        catch {
+          //
+        }
+      }
+
+
+      const value =
+        await buildLockedManifest(
+          channelId
+        );
+
+
+      L1_MANIFEST.set(
+        channelId,
+        {
+
+          expires:
+            Date.now() + 900,
+
+          value
+        }
+      );
+
+
+      try {
+
+        await putJsonCache(
+
+          cacheKey,
+
+          value,
+
+          CONFIG
+            .LIVE_MANIFEST_TTL
+        );
+
+      }
+
+      catch {
+        //
+      }
+
+
+      return value;
+    }
+  );
+}
+
+
+// ============================================================================
+// BUILD TIMELINE-LOCKED MANIFEST
+// ============================================================================
+
+async function buildLockedManifest(
+  channelId
+) {
+
+  let playback =
+    await getPlaybackInfo(
+      channelId
+    );
+
+
+  let lock =
+    await getTimelineLock(
+      channelId
+    );
+
+
+  // --------------------------------------------------------------------------
+  // CREATE LOCK
+  // --------------------------------------------------------------------------
+
+  if (!lock) {
+
+    const samples =
+      [];
+
+
+    for (
+      let i = 0;
+      i <
+      CONFIG.INITIAL_PROFILE_SAMPLES;
+      i++
+    ) {
+
+      try {
+
+        const candidate =
+          await fetchManifestCandidate(
+            playback
+          );
+
+
+        samples.push(
+          candidate
+        );
+
+      }
+
+      catch {
+        //
+      }
+    }
+
+
+    if (
+      !samples.length
+    ) {
+
+      // Fresh API lookup.
+      playback =
+        await getPlaybackInfo(
+          channelId,
+          true
+        );
+
+
+      samples.push(
+        await fetchManifestCandidate(
+          playback
+        )
+      );
+    }
+
+
+    const selected =
+      chooseProfile(
+        samples
+      );
+
+
+    lock = {
+
+      channelId:
+        String(channelId),
+
+      profile:
+        selected.profile,
+
+      lastSequence:
+        selected.sequence,
+
+      lastText:
+        selected.text,
+
+      lastUrl:
+        selected.finalUrl,
+
+      lastGoodAt:
+        Date.now()
+    };
+
+
+    await saveTimelineLock(
+      channelId,
+      lock
+    );
+
+
+    return selected;
+  }
+
+
+  // --------------------------------------------------------------------------
+  // TOKEN NEAR EXPIRY
+  // --------------------------------------------------------------------------
+
+  if (
+    tokenNearExpiry(
+      playback.url
+    )
+  ) {
+
+    playback =
+      await getPlaybackInfo(
+        channelId,
+        true
+      );
+  }
+
 
   let best =
     null;
 
 
+  // --------------------------------------------------------------------------
+  // ONLY ACCEPT THE SAME PROFILE
+  // --------------------------------------------------------------------------
+
   for (
-    let i = 0;
-    i < 5;
-    i++
+    let attempt = 0;
+    attempt <
+    CONFIG.MANIFEST_ATTEMPTS;
+    attempt++
   ) {
 
     try {
 
-      const item =
+      const candidate =
         await fetchManifestCandidate(
-
-          request,
-
-          state.upstreamUrl,
-
-          state.referer,
-
-          state.userAgent
+          playback
         );
 
 
       if (
-        item.profile !==
-        state.profile
+        candidate.profile !==
+        lock.profile
+      ) {
+
+        continue;
+      }
+
+
+      if (
+        candidate.sequence <
+        lock.lastSequence
       ) {
 
         continue;
@@ -1350,12 +932,12 @@ async function findLockedCandidate(
 
       if (
         !best ||
-        item.sequence >
-          best.sequence
+        candidate.sequence >
+        best.sequence
       ) {
 
         best =
-          item;
+          candidate;
       }
 
     }
@@ -1363,135 +945,135 @@ async function findLockedCandidate(
     catch {
       //
     }
+  }
+
+
+  // --------------------------------------------------------------------------
+  // REFRESH PLAYBACK URL AND TRY AGAIN
+  // --------------------------------------------------------------------------
+
+  if (!best) {
+
+    try {
+
+      playback =
+        await getPlaybackInfo(
+          channelId,
+          true
+        );
+
+
+      for (
+        let attempt = 0;
+        attempt < 4;
+        attempt++
+      ) {
+
+        try {
+
+          const candidate =
+            await fetchManifestCandidate(
+              playback
+            );
+
+
+          if (
+            candidate.profile ===
+              lock.profile &&
+            candidate.sequence >=
+              lock.lastSequence
+          ) {
+
+            best =
+              candidate;
+
+            break;
+          }
+
+        }
+
+        catch {
+          //
+        }
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  // --------------------------------------------------------------------------
+  // STALE-GOOD FALLBACK
+  //
+  // Better to repeat the most recent correct playlist briefly than suddenly
+  // jump 108xx -> 72xx and destroy the player's timeline.
+  // --------------------------------------------------------------------------
+
+  if (
+    !best &&
+    lock.lastText
+  ) {
+
+    return {
+
+      text:
+        lock.lastText,
+
+      finalUrl:
+        lock.lastUrl,
+
+      sequence:
+        lock.lastSequence,
+
+      targetDuration:
+        getTargetDuration(
+          lock.lastText
+        ),
+
+      profile:
+        lock.profile
+    };
   }
 
 
   if (!best) {
 
     throw new Error(
-      `Locked timeline ${state.profile} unavailable`
+      "Locked HLS timeline unavailable"
     );
   }
 
 
-  return best;
-}
+  // --------------------------------------------------------------------------
+  // UPDATE STATE
+  // --------------------------------------------------------------------------
+
+  lock.lastSequence =
+    best.sequence;
 
 
-// ============================================================================
-// TOKEN / ROOT RENEWAL
-// ============================================================================
-
-async function renewLockedRoot(
-  request,
-  oldState
-) {
-
-  let fallback =
-    null;
+  lock.lastText =
+    best.text;
 
 
-  // Try multiple API resolutions until SAME profile appears.
-  for (
-    let i = 0;
-    i < 8;
-    i++
-  ) {
-
-    try {
-
-      const fresh =
-        await getChannelStream(
-          oldState.channelId
-        );
+  lock.lastUrl =
+    best.finalUrl;
 
 
-      const candidate =
-        await fetchManifestCandidate(
-
-          request,
-
-          fresh.url,
-
-          fresh.referer,
-
-          fresh.userAgent
-        );
+  lock.lastGoodAt =
+    Date.now();
 
 
-      if (!fallback) {
-
-        fallback = {
-          fresh,
-          candidate
-        };
-      }
-
-
-      if (
-        candidate.profile ===
-        oldState.profile
-      ) {
-
-        oldState.upstreamUrl =
-          fresh.url;
-
-
-        oldState.referer =
-          fresh.referer;
-
-
-        oldState.userAgent =
-          fresh.userAgent;
-
-
-        // Only advance sequence.
-        if (
-          candidate.sequence >=
-          oldState.lastSequence
-        ) {
-
-          oldState.lastSequence =
-            candidate.sequence;
-
-
-          oldState.lastManifest =
-            candidate.text;
-
-
-          oldState.lastManifestUrl =
-            candidate.finalUrl;
-        }
-
-
-        await saveSession(
-          oldState
-        );
-
-
-        return oldState;
-      }
-
-    }
-
-    catch {
-      //
-    }
-  }
-
-
-  // Keep old source while still usable rather than jumping timelines.
-  if (
-    oldState.upstreamUrl
-  ) {
-
-    return oldState;
-  }
-
-
-  throw new Error(
-    "Unable to renew locked timeline"
+  await saveTimelineLock(
+    channelId,
+    lock
   );
+
+
+  return best;
 }
 
 
@@ -1500,25 +1082,17 @@ async function renewLockedRoot(
 // ============================================================================
 
 async function fetchManifestCandidate(
-
-  request,
-
-  upstreamUrl,
-
-  referer,
-
-  userAgent
+  playback
 ) {
 
   const headers =
-    upstreamHeaders(
+    new Headers();
 
-      request,
 
-      referer,
-
-      userAgent
-    );
+  headers.set(
+    "Accept",
+    "*/*"
+  );
 
 
   headers.set(
@@ -1527,15 +1101,48 @@ async function fetchManifestCandidate(
   );
 
 
+  headers.set(
+    "Pragma",
+    "no-cache"
+  );
+
+
+  if (
+    playback.referer
+  ) {
+
+    headers.set(
+      "Referer",
+      playback.referer
+    );
+  }
+
+
+  if (
+    playback.userAgent
+  ) {
+
+    headers.set(
+      "User-Agent",
+      playback.userAgent
+    );
+  }
+
+
   const response =
     await timedFetch(
 
-      upstreamUrl,
+      playback.url,
 
       {
-        method: "GET",
+
+        method:
+          "GET",
+
         headers,
-        redirect: "follow"
+
+        redirect:
+          "follow"
       },
 
       CONFIG.MANIFEST_TIMEOUT_MS
@@ -1563,20 +1170,14 @@ async function fetchManifestCandidate(
   ) {
 
     throw new Error(
-      "Not HLS"
+      "Not an HLS playlist"
     );
   }
 
 
   const finalUrl =
     response.url ||
-    upstreamUrl;
-
-
-  const targetDuration =
-    getTargetDuration(
-      text
-    );
+    playback.url;
 
 
   const sequence =
@@ -1585,9 +1186,17 @@ async function fetchManifestCandidate(
     );
 
 
-  const extension =
-    detectSegmentFamily(
+  const targetDuration =
+    getTargetDuration(
+      text
+    );
+
+
+  const family =
+    detectResourceFamily(
+
       text,
+
       finalUrl
     );
 
@@ -1598,41 +1207,153 @@ async function fetchManifestCandidate(
 
     finalUrl,
 
-    targetDuration,
-
     sequence,
 
-    extension,
+    targetDuration,
 
     profile:
-      `${targetDuration}|${extension}`
+      `${targetDuration}|${family}`
   };
 }
 
 
 // ============================================================================
-// RESOURCE
+// PROFILE SELECTION
 // ============================================================================
 
-async function proxyResource(
+function chooseProfile(
+  samples
+) {
+
+  const groups =
+    new Map();
+
+
+  for (
+    const sample
+    of samples
+  ) {
+
+    if (
+      !groups.has(
+        sample.profile
+      )
+    ) {
+
+      groups.set(
+        sample.profile,
+        []
+      );
+    }
+
+
+    groups
+      .get(
+        sample.profile
+      )
+      .push(
+        sample
+      );
+  }
+
+
+  let winner =
+    null;
+
+
+  for (
+    const group
+    of groups.values()
+  ) {
+
+    group.sort(
+      (
+        a,
+        b
+      ) =>
+        b.sequence -
+        a.sequence
+    );
+
+
+    if (
+      !winner ||
+      group.length >
+      winner.length
+    ) {
+
+      winner =
+        group;
+
+      continue;
+    }
+
+
+    if (
+      group.length ===
+      winner.length
+    ) {
+
+      const a =
+        group[0]
+          .targetDuration ||
+        999;
+
+
+      const b =
+        winner[0]
+          .targetDuration ||
+        999;
+
+
+      if (a < b) {
+
+        winner =
+          group;
+      }
+    }
+  }
+
+
+  return winner[0];
+}
+
+
+// ============================================================================
+// RESOURCE ROUTE
+// ============================================================================
+
+async function resourceRoute(
   request
 ) {
 
-  const url =
-    new URL(request.url);
+  const workerUrl =
+    new URL(
+      request.url
+    );
 
 
   const upstreamUrl =
-    url.searchParams.get("u");
+    workerUrl.searchParams.get(
+      "u"
+    );
 
 
-  const sid =
-    url.searchParams.get("sid");
+  const channelId =
+    workerUrl.searchParams.get(
+      "cid"
+    );
+
+
+  const profile =
+    workerUrl.searchParams.get(
+      "p"
+    ) || "default";
 
 
   if (
     !upstreamUrl ||
-    !sid
+    !channelId
   ) {
 
     return cors(
@@ -1644,29 +1365,672 @@ async function proxyResource(
   }
 
 
-  const state =
-    await loadSession(
-      sid
+  validateHttpUrl(
+    upstreamUrl
+  );
+
+
+  const playback =
+    await getPlaybackInfo(
+      channelId
     );
 
 
-  if (!state) {
+  // --------------------------------------------------------------------------
+  // MEDIA SEGMENTS
+  // --------------------------------------------------------------------------
+
+  if (
+    isLikelyMediaSegment(
+      upstreamUrl
+    )
+  ) {
+
+    return await serveMediaSegment(
+
+      request,
+
+      channelId,
+
+      profile,
+
+      upstreamUrl,
+
+      playback
+    );
+  }
+
+
+  // --------------------------------------------------------------------------
+  // UNKNOWN / MANIFEST / KEY
+  // --------------------------------------------------------------------------
+
+  return await serveGenericResource(
+
+    request,
+
+    channelId,
+
+    profile,
+
+    upstreamUrl,
+
+    playback
+  );
+}
+
+
+// ============================================================================
+// MEDIA SEGMENT CACHE
+// ============================================================================
+
+async function serveMediaSegment(
+
+  request,
+
+  channelId,
+
+  profile,
+
+  upstreamUrl,
+
+  playback
+) {
+
+  const canonical =
+    canonicalMediaIdentity(
+      upstreamUrl
+    );
+
+
+  const cacheKey =
+    internalRequest(
+
+      `segment/${encodeURIComponent(channelId)}/` +
+
+      `${encodeURIComponent(profile)}/` +
+
+      encodeURIComponent(
+        canonical
+      )
+    );
+
+
+  // --------------------------------------------------------------------------
+  // CACHE HIT
+  //
+  // Range request is passed to cache.match().
+  // If full response is cached with Content-Length Cloudflare can return
+  // a 206 slice.
+  // --------------------------------------------------------------------------
+
+  const hit =
+    await matchWithRange(
+
+      cacheKey,
+
+      request
+    );
+
+
+  if (hit) {
+
+    return decorateMediaResponse(
+      hit,
+      "HIT"
+    );
+  }
+
+
+  // --------------------------------------------------------------------------
+  // SINGLE UPSTREAM FETCH PER SEGMENT PER ISOLATE
+  // --------------------------------------------------------------------------
+
+  await dedupe(
+
+    `seg:${channelId}:${profile}:${canonical}`,
+
+    async () => {
+
+      // Someone may have filled it while waiting.
+      const secondCheck =
+        await caches.default.match(
+          cacheKey
+        );
+
+
+      if (secondCheck) {
+
+        return true;
+      }
+
+
+      const result =
+        await fetchSegmentWithRecovery(
+
+          channelId,
+
+          profile,
+
+          upstreamUrl,
+
+          playback
+        );
+
+
+      if (!result) {
+
+        return false;
+      }
+
+
+      const cacheable =
+        normalizeForCache(
+          result.response
+        );
+
+
+      if (!cacheable) {
+
+        return false;
+      }
+
+
+      const headers =
+        new Headers(
+          cacheable.headers
+        );
+
+
+      headers.delete(
+        "Set-Cookie"
+      );
+
+
+      headers.delete(
+        "Content-Range"
+      );
+
+
+      if (
+        headers.get("Vary") ===
+        "*"
+      ) {
+
+        headers.delete(
+          "Vary"
+        );
+      }
+
+
+      headers.set(
+        "Cache-Control",
+        `public, max-age=${CONFIG.SEGMENT_CACHE_TTL}`
+      );
+
+
+      headers.set(
+        "X-YCN-Origin-Host",
+        safeHost(
+          result.finalUrl
+        )
+      );
+
+
+      const stored =
+        new Response(
+
+          cacheable.body,
+
+          {
+
+            status:
+              200,
+
+            headers
+          }
+        );
+
+
+      try {
+
+        await caches.default.put(
+
+          cacheKey,
+
+          stored
+        );
+
+
+        return true;
+
+      }
+
+      catch (
+        error
+      ) {
+
+        console.log(
+          "SEGMENT CACHE PUT FAILED:",
+          error?.message ||
+          String(error)
+        );
+
+
+        return false;
+      }
+    }
+  );
+
+
+  // --------------------------------------------------------------------------
+  // TRY CACHE AFTER FILL
+  // --------------------------------------------------------------------------
+
+  const after =
+    await matchWithRange(
+
+      cacheKey,
+
+      request
+    );
+
+
+  if (after) {
+
+    return decorateMediaResponse(
+      after,
+      "MISS-FILLED"
+    );
+  }
+
+
+  // --------------------------------------------------------------------------
+  // FALLBACK DIRECT
+  // --------------------------------------------------------------------------
+
+  const direct =
+    await fetchSegmentWithRecovery(
+
+      channelId,
+
+      profile,
+
+      upstreamUrl,
+
+      playback
+    );
+
+
+  if (!direct) {
 
     return cors(
-      errorJson(
-        "Stream session expired",
-        410
+      new Response(
+
+        "Upstream segment unavailable",
+
+        {
+
+          status:
+            504,
+
+          headers: {
+
+            "Content-Type":
+              "text/plain; charset=utf-8",
+
+            "Cache-Control":
+              "no-store",
+
+            "X-YCN-Cache":
+              "FAIL"
+          }
+        }
       )
     );
   }
 
 
-  // ========================================================================
-  // FIRST TRY
-  // ========================================================================
+  return proxyBinaryResponse(
 
-  let response =
-    null;
+    request,
+
+    direct.response,
+
+    direct.finalUrl,
+
+    "BYPASS"
+  );
+}
+
+
+// ============================================================================
+// SEGMENT FETCH + FAILOVER
+// ============================================================================
+
+async function fetchSegmentWithRecovery(
+
+  channelId,
+
+  profile,
+
+  originalUrl,
+
+  playback
+) {
+
+  let currentUrl =
+    originalUrl;
+
+
+  let currentPlayback =
+    playback;
+
+
+  for (
+    let attempt = 0;
+    attempt <
+    CONFIG.SEGMENT_ATTEMPTS;
+    attempt++
+  ) {
+
+    try {
+
+      // IMPORTANT:
+      // deliberately do NOT forward client Range when filling the shared cache.
+      // We want the whole media object whenever possible.
+      const response =
+        await timedFetch(
+
+          currentUrl,
+
+          {
+
+            method:
+              "GET",
+
+            headers:
+              originHeaders(
+
+                currentPlayback,
+
+                false
+              ),
+
+            redirect:
+              "follow"
+          },
+
+          CONFIG.SEGMENT_TIMEOUT_MS
+        );
+
+
+      if (
+        response.ok
+      ) {
+
+        return {
+
+          response,
+
+          finalUrl:
+            response.url ||
+            currentUrl
+        };
+      }
+
+
+      try {
+
+        response.body?.cancel();
+
+      }
+
+      catch {
+        //
+      }
+
+    }
+
+    catch {
+      //
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Find same media identity from a fresh locked playlist.
+    // ------------------------------------------------------------------------
+
+    const alternative =
+      await findAlternativeResource(
+
+        channelId,
+
+        profile,
+
+        currentUrl
+      );
+
+
+    if (
+      alternative &&
+      alternative !==
+      currentUrl
+    ) {
+
+      currentUrl =
+        alternative;
+
+      continue;
+    }
+
+
+    // Refresh playback information for next attempt.
+    try {
+
+      currentPlayback =
+        await getPlaybackInfo(
+
+          channelId,
+
+          true
+        );
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  return null;
+}
+
+
+// ============================================================================
+// ALTERNATIVE CDN RESOURCE
+// ============================================================================
+
+async function findAlternativeResource(
+
+  channelId,
+
+  profile,
+
+  failedUrl
+) {
+
+  const wanted =
+    canonicalMediaIdentity(
+      failedUrl
+    );
+
+
+  for (
+    let attempt = 0;
+    attempt <
+    CONFIG.ALTERNATIVE_LOOKUPS;
+    attempt++
+  ) {
+
+    try {
+
+      const manifest =
+        await getSharedManifest(
+
+          channelId,
+
+          true
+        );
+
+
+      if (
+        manifest.profile !==
+        profile
+      ) {
+
+        continue;
+      }
+
+
+      const resources =
+        extractResources(
+
+          manifest.text,
+
+          manifest.finalUrl
+        );
+
+
+      for (
+        const url
+        of resources
+      ) {
+
+        if (
+          canonicalMediaIdentity(
+            url
+          ) === wanted &&
+          url !== failedUrl
+        ) {
+
+          return url;
+        }
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  return null;
+}
+
+
+// ============================================================================
+// GENERIC RESOURCE
+// ============================================================================
+
+async function serveGenericResource(
+
+  request,
+
+  channelId,
+
+  profile,
+
+  upstreamUrl,
+
+  playback
+) {
+
+  const key =
+    internalRequest(
+
+      `generic/${encodeURIComponent(channelId)}/` +
+
+      encodeURIComponent(
+        upstreamUrl
+      )
+    );
+
+
+  // --------------------------------------------------------------------------
+  // SHORT CACHE FOR KEYS / AUXILIARY OBJECTS
+  // --------------------------------------------------------------------------
+
+  const cached =
+    await matchWithRange(
+      key,
+      request
+    );
+
+
+  if (cached) {
+
+    const type =
+      cached.headers.get(
+        "Content-Type"
+      ) || "";
+
+
+    if (
+      isManifestType(
+        upstreamUrl,
+        type
+      )
+    ) {
+
+      const text =
+        await cached.text();
+
+
+      const rewritten =
+        await rewriteManifest(
+
+          text,
+
+          upstreamUrl,
+
+          new URL(
+            request.url
+          ).origin,
+
+          channelId,
+
+          profile
+        );
+
+
+      return cors(
+        new Response(
+          rewritten,
+          {
+            status: 200,
+            headers:
+              playlistHeaders()
+          }
+        )
+      );
+    }
+
+
+    return decorateMediaResponse(
+      cached,
+      "GENERIC-HIT"
+    );
+  }
+
+
+  // --------------------------------------------------------------------------
+  // FETCH
+  // --------------------------------------------------------------------------
+
+  let response;
 
 
   try {
@@ -1677,115 +2041,54 @@ async function proxyResource(
         upstreamUrl,
 
         {
-          method: "GET",
+
+          method:
+            "GET",
 
           headers:
-            upstreamHeaders(
+            originHeaders(
 
-              request,
+              playback,
 
-              state.referer,
-
-              state.userAgent
+              false
             ),
 
-          redirect: "follow"
+          redirect:
+            "follow"
         },
 
-        CONFIG.SEGMENT_TIMEOUT_MS
+        CONFIG.GENERIC_TIMEOUT_MS
       );
 
   }
 
   catch {
-    response = null;
-  }
-
-
-  // ========================================================================
-  // FAILED HOST => FIND SAME RESOURCE ON CURRENT LOCKED PLAYLIST
-  // ========================================================================
-
-  if (
-    !response ||
-    !response.ok
-  ) {
-
-    const alternative =
-      await recoverResourceUrl(
-
-        request,
-
-        state,
-
-        upstreamUrl
-      );
-
-
-    if (alternative) {
-
-      try {
-
-        response =
-          await timedFetch(
-
-            alternative,
-
-            {
-              method: "GET",
-
-              headers:
-                upstreamHeaders(
-
-                  request,
-
-                  state.referer,
-
-                  state.userAgent
-                ),
-
-              redirect:
-                "follow"
-            },
-
-            CONFIG.SEGMENT_TIMEOUT_MS
-          );
-
-      }
-
-      catch {
-        response = null;
-      }
-    }
-  }
-
-
-  if (
-    !response ||
-    !response.ok
-  ) {
 
     return cors(
       new Response(
 
-        response
-          ? `Upstream HTTP ${response.status}`
-          : "Upstream segment timeout",
+        "Upstream timeout",
 
         {
           status:
-            response
-              ? response.status
-              : 504,
+            504
+        }
+      )
+    );
+  }
 
-          headers: {
 
-            "Content-Type":
-              "text/plain; charset=utf-8",
+  if (!response.ok) {
 
-            "Cache-Control":
-              "no-store"
-          }
+    return cors(
+      new Response(
+
+        `Upstream HTTP ${response.status}`,
+
+        {
+
+          status:
+            response.status
         }
       )
     );
@@ -1797,20 +2100,20 @@ async function proxyResource(
     upstreamUrl;
 
 
-  const type =
+  const contentType =
     response.headers.get(
       "Content-Type"
     ) || "";
 
 
-  // ========================================================================
-  // CHILD M3U8
-  // ========================================================================
+  // --------------------------------------------------------------------------
+  // CHILD PLAYLIST
+  // --------------------------------------------------------------------------
 
   if (
-    isManifest(
+    isManifestType(
       finalUrl,
-      type
+      contentType
     )
   ) {
 
@@ -1818,37 +2121,1987 @@ async function proxyResource(
       await response.text();
 
 
-    const rewritten =
-      rewriteManifest(
+    if (
+      text
+        .trimStart()
+        .startsWith(
+          "#EXTM3U"
+        )
+    ) {
 
-        text,
+      const rewritten =
+        await rewriteManifest(
 
-        finalUrl,
+          text,
 
-        url.origin,
+          finalUrl,
 
-        sid,
+          new URL(
+            request.url
+          ).origin,
 
-        state
+          channelId,
+
+          profile
+        );
+
+
+      return cors(
+        new Response(
+
+          request.method === "HEAD"
+            ? null
+            : rewritten,
+
+          {
+            status:
+              200,
+
+            headers:
+              playlistHeaders()
+          }
+        )
+      );
+    }
+  }
+
+
+  // --------------------------------------------------------------------------
+  // CACHE SMALL GENERIC BINARY
+  // --------------------------------------------------------------------------
+
+  const cacheable =
+    normalizeForCache(
+      response
+    );
+
+
+  if (cacheable) {
+
+    const headers =
+      new Headers(
+        cacheable.headers
       );
 
 
-    return cors(
-      new Response(
-        rewritten,
-        {
-          status: 200,
-          headers:
-            playlistHeaders()
-        }
-      )
+    headers.delete(
+      "Set-Cookie"
+    );
+
+
+    headers.delete(
+      "Content-Range"
+    );
+
+
+    if (
+      headers.get("Vary") ===
+      "*"
+    ) {
+
+      headers.delete(
+        "Vary"
+      );
+    }
+
+
+    headers.set(
+      "Cache-Control",
+
+      `public, max-age=${CONFIG.GENERIC_RESOURCE_TTL}`
+    );
+
+
+    try {
+
+      await caches.default.put(
+
+        key,
+
+        new Response(
+
+          cacheable.body,
+
+          {
+
+            status:
+              200,
+
+            headers
+          }
+        )
+      );
+
+
+      const stored =
+        await matchWithRange(
+          key,
+          request
+        );
+
+
+      if (stored) {
+
+        return decorateMediaResponse(
+          stored,
+          "GENERIC-FILLED"
+        );
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  return proxyBinaryResponse(
+
+    request,
+
+    response,
+
+    finalUrl,
+
+    "GENERIC-BYPASS"
+  );
+}
+
+
+// ============================================================================
+// NORMALIZE 206 => CACHEABLE 200 ONLY IF RESPONSE IS ACTUALLY FULL OBJECT
+//
+// cache.put() rejects status 206.
+// ============================================================================
+
+function normalizeForCache(
+  response
+) {
+
+  if (
+    response.status ===
+    200
+  ) {
+
+    return new Response(
+
+      response.body,
+
+      {
+
+        status:
+          200,
+
+        headers:
+          new Headers(
+            response.headers
+          )
+      }
     );
   }
 
 
-  // ========================================================================
-  // SEGMENT / AES KEY
-  // ========================================================================
+  if (
+    response.status !==
+    206
+  ) {
+
+    return null;
+  }
+
+
+  const contentRange =
+    response.headers.get(
+      "Content-Range"
+    );
+
+
+  if (!contentRange) {
+
+    return null;
+  }
+
+
+  const match =
+    contentRange.match(
+
+      /^bytes\s+0-(\d+)\/(\d+)$/i
+    );
+
+
+  if (!match) {
+
+    return null;
+  }
+
+
+  const end =
+    Number(
+      match[1]
+    );
+
+
+  const total =
+    Number(
+      match[2]
+    );
+
+
+  if (
+    !Number.isFinite(end) ||
+    !Number.isFinite(total)
+  ) {
+
+    return null;
+  }
+
+
+  // It must contain bytes 0 ... total-1.
+  if (
+    end + 1 !==
+    total
+  ) {
+
+    return null;
+  }
+
+
+  const headers =
+    new Headers(
+      response.headers
+    );
+
+
+  headers.delete(
+    "Content-Range"
+  );
+
+
+  headers.set(
+    "Content-Length",
+    String(total)
+  );
+
+
+  headers.set(
+    "Accept-Ranges",
+    "bytes"
+  );
+
+
+  return new Response(
+
+    response.body,
+
+    {
+
+      status:
+        200,
+
+      headers
+    }
+  );
+}
+
+
+// ============================================================================
+// RANGE-AWARE CACHE LOOKUP
+// ============================================================================
+
+async function matchWithRange(
+  key,
+  clientRequest
+) {
+
+  try {
+
+    const range =
+      clientRequest.headers.get(
+        "Range"
+      );
+
+
+    if (!range) {
+
+      return await caches.default.match(
+        key
+      );
+    }
+
+
+    const rangeRequest =
+      new Request(
+
+        key.url,
+
+        {
+
+          method:
+            "GET",
+
+          headers: {
+
+            "Range":
+              range
+          }
+        }
+      );
+
+
+    return await caches.default.match(
+      rangeRequest
+    );
+
+  }
+
+  catch {
+
+    return null;
+  }
+}
+
+
+// ============================================================================
+// PLAYBACK API CACHE
+// ============================================================================
+
+async function getPlaybackInfo(
+  channelId,
+  force = false
+) {
+
+  const now =
+    Date.now();
+
+
+  if (!force) {
+
+    const l1 =
+      L1_PLAYBACK.get(
+        channelId
+      );
+
+
+    if (
+      l1 &&
+      l1.expires >
+      now
+    ) {
+
+      return l1.value;
+    }
+  }
+
+
+  const key =
+    internalRequest(
+      `playback/${channelId}`
+    );
+
+
+  if (!force) {
+
+    try {
+
+      const cached =
+        await caches.default.match(
+          key
+        );
+
+
+      if (cached) {
+
+        const value =
+          await cached.json();
+
+
+        L1_PLAYBACK.set(
+          channelId,
+          {
+
+            expires:
+              now + 15000,
+
+            value
+          }
+        );
+
+
+        return value;
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  return await dedupe(
+
+    `playback:${channelId}`,
+
+    async () => {
+
+      const payload =
+        normalize(
+
+          await apiFetch(
+
+            `channel/${encodeURIComponent(channelId)}`
+          )
+        );
+
+
+      let data =
+        payload;
+
+
+      if (
+        Array.isArray(data)
+      ) {
+
+        data =
+          data.find(
+            item =>
+              item &&
+              (
+                item.url ||
+                item.stream_url ||
+                item.link
+              )
+          ) ||
+          data[0];
+      }
+
+
+      if (
+        !data ||
+        typeof data !==
+        "object"
+      ) {
+
+        throw new Error(
+          "Invalid channel playback response"
+        );
+      }
+
+
+      const streamUrl =
+        data.url ||
+        data.stream_url ||
+        data.link;
+
+
+      if (!streamUrl) {
+
+        throw new Error(
+          "Missing stream URL"
+        );
+      }
+
+
+      validateHttpUrl(
+        streamUrl
+      );
+
+
+      const value = {
+
+        channelId:
+          String(channelId),
+
+        url:
+          streamUrl,
+
+        referer:
+
+          data.referer ||
+
+          data.headers?.Referer ||
+
+          data.headers?.referer ||
+
+          CONFIG.DEFAULT_REFERER,
+
+        userAgent:
+
+          data.user_agent ||
+
+          data.userAgent ||
+
+          data.headers?.["User-Agent"] ||
+
+          data.headers?.["user-agent"] ||
+
+          CONFIG.DEFAULT_PLAYER_UA
+      };
+
+
+      L1_PLAYBACK.set(
+        channelId,
+        {
+
+          expires:
+            Date.now() +
+            15000,
+
+          value
+        }
+      );
+
+
+      try {
+
+        await putJsonCache(
+
+          key,
+
+          value,
+
+          CONFIG.PLAYBACK_TTL
+        );
+
+      }
+
+      catch {
+        //
+      }
+
+
+      return value;
+    }
+  );
+}
+
+
+// ============================================================================
+// TIMELINE LOCK CACHE
+// ============================================================================
+
+async function getTimelineLock(
+  channelId
+) {
+
+  const key =
+    internalRequest(
+      `lock/${channelId}`
+    );
+
+
+  try {
+
+    const cached =
+      await caches.default.match(
+        key
+      );
+
+
+    if (!cached) {
+
+      return null;
+    }
+
+
+    return await cached.json();
+
+  }
+
+  catch {
+
+    return null;
+  }
+}
+
+
+async function saveTimelineLock(
+  channelId,
+  state
+) {
+
+  const key =
+    internalRequest(
+      `lock/${channelId}`
+    );
+
+
+  try {
+
+    await putJsonCache(
+
+      key,
+
+      state,
+
+      CONFIG.LOCK_TTL
+    );
+
+  }
+
+  catch {
+    //
+  }
+}
+
+
+// ============================================================================
+// CATEGORIES
+// ============================================================================
+
+async function getCategories() {
+
+  const key =
+    internalRequest(
+      "categories"
+    );
+
+
+  try {
+
+    const cached =
+      await caches.default.match(
+        key
+      );
+
+
+    if (cached) {
+
+      return await cached.json();
+    }
+
+  }
+
+  catch {
+    //
+  }
+
+
+  const data =
+    normalize(
+      await apiFetch(
+        "categories"
+      )
+    );
+
+
+  if (
+    !Array.isArray(data)
+  ) {
+
+    throw new Error(
+      "Invalid categories response"
+    );
+  }
+
+
+  await putJsonCache(
+
+    key,
+
+    data,
+
+    CONFIG.CATEGORY_TTL
+  );
+
+
+  return data;
+}
+
+
+async function getCategoryChannels(
+  categoryId
+) {
+
+  const key =
+    internalRequest(
+
+      `category/${categoryId}`
+    );
+
+
+  try {
+
+    const cached =
+      await caches.default.match(
+        key
+      );
+
+
+    if (cached) {
+
+      return await cached.json();
+    }
+
+  }
+
+  catch {
+    //
+  }
+
+
+  const data =
+    normalize(
+
+      await apiFetch(
+
+        `categories/${encodeURIComponent(categoryId)}/channels`
+      )
+    );
+
+
+  if (
+    !Array.isArray(data)
+  ) {
+
+    throw new Error(
+      "Invalid channels response"
+    );
+  }
+
+
+  await putJsonCache(
+
+    key,
+
+    data,
+
+    CONFIG.CATEGORY_TTL
+  );
+
+
+  return data;
+}
+
+
+// ============================================================================
+// API FETCH + DECRYPT
+// ============================================================================
+
+async function apiFetch(
+  endpoint
+) {
+
+  const url =
+
+    `${CONFIG.API_BASE}/` +
+
+    String(endpoint)
+      .replace(/^\/+/, "");
+
+
+  const headers =
+    new Headers();
+
+
+  headers.set(
+    "User-Agent",
+    CONFIG.API_UA
+  );
+
+
+  headers.set(
+    "Accept",
+    "application/json"
+  );
+
+
+  headers.set(
+    "Cache-Control",
+    "no-cache"
+  );
+
+
+  const response =
+    await timedFetch(
+
+      url,
+
+      {
+
+        method:
+          "GET",
+
+        headers,
+
+        redirect:
+          "follow"
+      },
+
+      CONFIG.API_TIMEOUT_MS
+    );
+
+
+  if (!response.ok) {
+
+    throw new Error(
+      `API HTTP ${response.status}`
+    );
+  }
+
+
+  const t =
+    response.headers.get(
+      "t"
+    );
+
+
+  if (!t) {
+
+    throw new Error(
+      "Missing API t header"
+    );
+  }
+
+
+  const encrypted =
+    (
+      await response.text()
+    ).trim();
+
+
+  return decryptPayload(
+
+    encrypted,
+
+    t
+  );
+}
+
+
+// ============================================================================
+// XOR
+// ============================================================================
+
+function decryptPayload(
+  encrypted,
+  t
+) {
+
+  let binary;
+
+
+  try {
+
+    binary =
+      atob(encrypted);
+
+  }
+
+  catch {
+
+    throw new Error(
+      "Invalid Base64 API response"
+    );
+  }
+
+
+  const input =
+    new Uint8Array(
+      binary.length
+    );
+
+
+  for (
+    let i = 0;
+    i <
+    binary.length;
+    i++
+  ) {
+
+    input[i] =
+      binary.charCodeAt(i);
+  }
+
+
+  const key =
+    new TextEncoder()
+      .encode(
+
+        CONFIG.STATIC_KEY +
+        String(t)
+      );
+
+
+  const output =
+    new Uint8Array(
+      input.length
+    );
+
+
+  for (
+    let i = 0;
+    i <
+    input.length;
+    i++
+  ) {
+
+    output[i] =
+
+      input[i] ^
+
+      key[
+        i %
+        key.length
+      ];
+  }
+
+
+  const text =
+    new TextDecoder(
+      "utf-8"
+    ).decode(
+      output
+    );
+
+
+  try {
+
+    return JSON.parse(
+      text
+    );
+
+  }
+
+  catch {
+
+    throw new Error(
+      "Invalid decrypted JSON"
+    );
+  }
+}
+
+
+// ============================================================================
+// NORMALIZE API DATA
+// ============================================================================
+
+function normalize(
+  payload
+) {
+
+  if (
+    payload &&
+    typeof payload ===
+      "object" &&
+    Object.prototype
+      .hasOwnProperty.call(
+        payload,
+        "data"
+      )
+  ) {
+
+    return payload.data;
+  }
+
+
+  return payload;
+}
+
+
+// ============================================================================
+// MANIFEST REWRITE
+// ============================================================================
+
+async function rewriteManifest(
+
+  manifest,
+
+  sourceUrl,
+
+  workerOrigin,
+
+  channelId,
+
+  profile
+) {
+
+  const base =
+    new URL(
+      sourceUrl
+    );
+
+
+  const lines =
+    manifest.split(
+      /\r?\n/
+    );
+
+
+  const output =
+    [];
+
+
+  for (
+    const original
+    of lines
+  ) {
+
+    const line =
+      original.trim();
+
+
+    if (!line) {
+
+      output.push(
+        original
+      );
+
+      continue;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // URI="..."
+    // ------------------------------------------------------------------------
+
+    if (
+      line.startsWith("#")
+    ) {
+
+      const rewritten =
+        original.replace(
+
+          /URI=(["'])(.*?)\1/gi,
+
+          (
+            full,
+            quote,
+            value
+          ) => {
+
+            try {
+
+              const absolute =
+                resolveChildUrl(
+
+                  value,
+
+                  base
+                );
+
+
+              const proxied =
+                buildResourceUrl(
+
+                  workerOrigin,
+
+                  channelId,
+
+                  profile,
+
+                  absolute
+                );
+
+
+              return (
+
+                `URI=${quote}` +
+
+                proxied +
+
+                quote
+              );
+
+            }
+
+            catch {
+
+              return full;
+            }
+          }
+        );
+
+
+      output.push(
+        rewritten
+      );
+
+      continue;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // MEDIA URI
+    // ------------------------------------------------------------------------
+
+    try {
+
+      const absolute =
+        resolveChildUrl(
+
+          line,
+
+          base
+        );
+
+
+      output.push(
+
+        buildResourceUrl(
+
+          workerOrigin,
+
+          channelId,
+
+          profile,
+
+          absolute
+        )
+      );
+
+    }
+
+    catch {
+
+      output.push(
+        original
+      );
+    }
+  }
+
+
+  return output.join(
+    "\n"
+  );
+}
+
+
+// ============================================================================
+// RESOURCE URL
+// ============================================================================
+
+function buildResourceUrl(
+
+  origin,
+
+  channelId,
+
+  profile,
+
+  upstreamUrl
+) {
+
+  const params =
+    new URLSearchParams();
+
+
+  params.set(
+    "cid",
+    channelId
+  );
+
+
+  params.set(
+    "p",
+    profile
+  );
+
+
+  params.set(
+    "u",
+    upstreamUrl
+  );
+
+
+  return (
+
+    `${origin}/_r?` +
+
+    params.toString()
+  );
+}
+
+
+// ============================================================================
+// RELATIVE URL + AUTH QUERY INHERITANCE
+// ============================================================================
+
+function resolveChildUrl(
+  value,
+  parent
+) {
+
+  const target =
+    new URL(
+
+      value,
+
+      parent
+    );
+
+
+  const authKeys = [
+
+    "t",
+
+    "e",
+
+    "token",
+
+    "auth",
+
+    "expires",
+
+    "signature",
+
+    "sig"
+  ];
+
+
+  for (
+    const key
+    of authKeys
+  ) {
+
+    if (
+      !target.searchParams.has(
+        key
+      ) &&
+      parent.searchParams.has(
+        key
+      )
+    ) {
+
+      target.searchParams.set(
+
+        key,
+
+        parent.searchParams.get(
+          key
+        )
+      );
+    }
+  }
+
+
+  return target.href;
+}
+
+
+// ============================================================================
+// EXTRACT PLAYLIST RESOURCES
+// ============================================================================
+
+function extractResources(
+
+  manifest,
+
+  sourceUrl
+) {
+
+  const base =
+    new URL(
+      sourceUrl
+    );
+
+
+  const output =
+    [];
+
+
+  for (
+    const raw
+    of manifest.split(/\r?\n/)
+  ) {
+
+    const line =
+      raw.trim();
+
+
+    if (!line) {
+
+      continue;
+    }
+
+
+    if (
+      !line.startsWith("#")
+    ) {
+
+      try {
+
+        output.push(
+
+          resolveChildUrl(
+
+            line,
+
+            base
+          )
+        );
+
+      }
+
+      catch {
+        //
+      }
+    }
+
+
+    const regex =
+      /URI=(["'])(.*?)\1/gi;
+
+
+    let match;
+
+
+    while (
+      (
+        match =
+          regex.exec(raw)
+      ) !== null
+    ) {
+
+      try {
+
+        output.push(
+
+          resolveChildUrl(
+
+            match[2],
+
+            base
+          )
+        );
+
+      }
+
+      catch {
+        //
+      }
+    }
+  }
+
+
+  return output;
+}
+
+
+// ============================================================================
+// CANONICAL MEDIA IDENTITY
+//
+// Different CDN hosts:
+//
+// h1.domain/abc/channel/12345.pdf?t=A
+// h55.other/abc/channel/12345.pdf?t=B
+//
+// represent the same immutable segment.
+//
+// Host and volatile auth parameters are intentionally ignored.
+// ============================================================================
+
+function canonicalMediaIdentity(
+  value
+) {
+
+  try {
+
+    const url =
+      new URL(value);
+
+
+    const params =
+      new URLSearchParams(
+        url.search
+      );
+
+
+    const volatile = [
+
+      "t",
+
+      "e",
+
+      "token",
+
+      "auth",
+
+      "expires",
+
+      "signature",
+
+      "sig"
+    ];
+
+
+    for (
+      const key
+      of volatile
+    ) {
+
+      params.delete(
+        key
+      );
+    }
+
+
+    const entries =
+      [...params.entries()]
+        .sort(
+          (
+            a,
+            b
+          ) =>
+            a[0]
+              .localeCompare(
+                b[0]
+              )
+        );
+
+
+    const stable =
+      new URLSearchParams(
+        entries
+      ).toString();
+
+
+    return (
+
+      url.pathname +
+
+      (
+        stable
+          ? `?${stable}`
+          : ""
+      )
+    );
+
+  }
+
+  catch {
+
+    return String(value);
+  }
+}
+
+
+// ============================================================================
+// MEDIA SEGMENT DETECTION
+// ============================================================================
+
+function isLikelyMediaSegment(
+  value
+) {
+
+  try {
+
+    const path =
+      new URL(value)
+        .pathname
+        .toLowerCase();
+
+
+    return (
+
+      path.endsWith(
+        ".ts"
+      ) ||
+
+      path.endsWith(
+        ".mpegts"
+      ) ||
+
+      path.endsWith(
+        ".pdf"
+      ) ||
+
+      path.endsWith(
+        ".js"
+      ) ||
+
+      path.endsWith(
+        ".m4s"
+      ) ||
+
+      path.endsWith(
+        ".cmfv"
+      ) ||
+
+      path.endsWith(
+        ".cmfa"
+      ) ||
+
+      path.endsWith(
+        ".aac"
+      ) ||
+
+      path.endsWith(
+        ".mp4"
+      )
+    );
+
+  }
+
+  catch {
+
+    return false;
+  }
+}
+
+
+// ============================================================================
+// TIMELINE INFO
+// ============================================================================
+
+function getMediaSequence(
+  manifest
+) {
+
+  const match =
+    manifest.match(
+
+      /#EXT-X-MEDIA-SEQUENCE:(\d+)/i
+    );
+
+
+  return match
+    ? Number(match[1])
+    : 0;
+}
+
+
+function getTargetDuration(
+  manifest
+) {
+
+  const match =
+    manifest.match(
+
+      /#EXT-X-TARGETDURATION:(\d+)/i
+    );
+
+
+  return match
+    ? Number(match[1])
+    : 0;
+}
+
+
+function detectResourceFamily(
+
+  manifest,
+
+  sourceUrl
+) {
+
+  const base =
+    new URL(
+      sourceUrl
+    );
+
+
+  for (
+    const raw
+    of manifest.split(/\r?\n/)
+  ) {
+
+    const line =
+      raw.trim();
+
+
+    if (
+      !line ||
+      line.startsWith("#")
+    ) {
+
+      continue;
+    }
+
+
+    try {
+
+      const pathname =
+        new URL(
+          line,
+          base
+        )
+          .pathname
+          .toLowerCase();
+
+
+      const match =
+        pathname.match(
+          /\.([a-z0-9]+)$/
+        );
+
+
+      if (match) {
+
+        return match[1];
+      }
+
+    }
+
+    catch {
+      //
+    }
+  }
+
+
+  return "unknown";
+}
+
+
+// ============================================================================
+// TOKEN
+// ============================================================================
+
+function tokenNearExpiry(
+  value
+) {
+
+  try {
+
+    const url =
+      new URL(value);
+
+
+    const expiry =
+      Number(
+        url.searchParams.get(
+          "e"
+        )
+      );
+
+
+    if (
+      !Number.isFinite(
+        expiry
+      ) ||
+      expiry <= 0
+    ) {
+
+      return false;
+    }
+
+
+    const now =
+      Math.floor(
+        Date.now() /
+        1000
+      );
+
+
+    return (
+
+      expiry -
+      now <=
+
+      CONFIG
+        .TOKEN_REFRESH_MARGIN
+    );
+
+  }
+
+  catch {
+
+    return false;
+  }
+}
+
+
+// ============================================================================
+// ORIGIN HEADERS
+// ============================================================================
+
+function originHeaders(
+
+  playback,
+
+  includeRange,
+
+  request = null
+) {
+
+  const headers =
+    new Headers();
+
+
+  headers.set(
+    "Accept",
+    "*/*"
+  );
+
+
+  if (
+    playback?.referer
+  ) {
+
+    headers.set(
+      "Referer",
+      playback.referer
+    );
+  }
+
+
+  if (
+    playback?.userAgent
+  ) {
+
+    headers.set(
+      "User-Agent",
+      playback.userAgent
+    );
+  }
+
+
+  // Normally false for shared segment cache fill.
+  if (
+    includeRange &&
+    request
+  ) {
+
+    const range =
+      request.headers.get(
+        "Range"
+      );
+
+
+    if (range) {
+
+      headers.set(
+        "Range",
+        range
+      );
+    }
+  }
+
+
+  return headers;
+}
+
+
+// ============================================================================
+// FETCH TIMEOUT
+// ============================================================================
+
+async function timedFetch(
+
+  url,
+
+  options,
+
+  timeoutMs
+) {
+
+  const controller =
+    new AbortController();
+
+
+  const timer =
+    setTimeout(
+
+      () =>
+        controller.abort(),
+
+      timeoutMs
+    );
+
+
+  try {
+
+    return await fetch(
+
+      url,
+
+      {
+
+        ...options,
+
+        signal:
+          controller.signal
+      }
+    );
+
+  }
+
+  finally {
+
+    clearTimeout(
+      timer
+    );
+  }
+}
+
+
+// ============================================================================
+// REQUEST DEDUPLICATION
+// ============================================================================
+
+async function dedupe(
+  key,
+  producer
+) {
+
+  if (
+    INFLIGHT.has(
+      key
+    )
+  ) {
+
+    return await INFLIGHT.get(
+      key
+    );
+  }
+
+
+  const promise =
+    (
+      async () =>
+        await producer()
+    )();
+
+
+  INFLIGHT.set(
+    key,
+    promise
+  );
+
+
+  try {
+
+    return await promise;
+
+  }
+
+  finally {
+
+    INFLIGHT.delete(
+      key
+    );
+  }
+}
+
+
+// ============================================================================
+// INTERNAL CACHE KEY
+// ============================================================================
+
+function internalRequest(
+  path
+) {
+
+  return new Request(
+
+    `https://ycn-cache.internal/${path}`,
+
+    {
+      method:
+        "GET"
+    }
+  );
+}
+
+
+// ============================================================================
+// JSON CACHE
+// ============================================================================
+
+async function putJsonCache(
+
+  key,
+
+  value,
+
+  ttl
+) {
+
+  const response =
+    new Response(
+
+      JSON.stringify(
+        value
+      ),
+
+      {
+
+        status:
+          200,
+
+        headers: {
+
+          "Content-Type":
+            "application/json",
+
+          "Cache-Control":
+            `public, max-age=${ttl}`
+        }
+      }
+    );
+
+
+  await caches.default.put(
+
+    key,
+
+    response
+  );
+}
+
+
+// ============================================================================
+// RESPONSE HELPERS
+// ============================================================================
+
+function decorateMediaResponse(
+  response,
+  cacheStatus
+) {
+
+  const headers =
+    new Headers(
+      response.headers
+    );
+
+
+  headers.set(
+    "X-YCN-Version",
+    "6.0"
+  );
+
+
+  headers.set(
+    "X-YCN-Cache",
+    cacheStatus
+  );
+
+
+  headers.set(
+    "Access-Control-Allow-Origin",
+    CONFIG.CORS
+  );
+
+
+  return new Response(
+
+    response.body,
+
+    {
+
+      status:
+        response.status,
+
+      statusText:
+        response.statusText,
+
+      headers
+    }
+  );
+}
+
+
+function proxyBinaryResponse(
+
+  request,
+
+  response,
+
+  finalUrl,
+
+  cacheStatus
+) {
 
   const headers =
     new Headers();
@@ -1875,12 +4128,23 @@ async function proxyResource(
   );
 
 
+  copyHeader(
+    response.headers,
+    headers,
+    "ETag"
+  );
+
+
   headers.set(
     "Content-Type",
 
-    mediaContentType(
+    detectContentType(
+
       finalUrl,
-      type
+
+      response.headers.get(
+        "Content-Type"
+      ) || ""
     )
   );
 
@@ -1893,18 +4157,26 @@ async function proxyResource(
 
   headers.set(
     "X-YCN-Version",
-    "5.0"
+    "6.0"
+  );
+
+
+  headers.set(
+    "X-YCN-Cache",
+    cacheStatus
   );
 
 
   return cors(
     new Response(
 
-      request.method === "HEAD"
+      request.method ===
+      "HEAD"
         ? null
         : response.body,
 
       {
+
         status:
           response.status,
 
@@ -1916,828 +4188,8 @@ async function proxyResource(
 
 
 // ============================================================================
-// BAD SEGMENT HOST RECOVERY
+// PLAYLIST HEADERS
 // ============================================================================
-
-async function recoverResourceUrl(
-
-  request,
-
-  state,
-
-  failedUrl
-) {
-
-  const identity =
-    resourceIdentity(
-      failedUrl
-    );
-
-
-  if (!identity) {
-
-    return null;
-  }
-
-
-  // Re-read same root several times but ONLY accept locked timeline.
-  for (
-    let attempt = 0;
-    attempt < 3;
-    attempt++
-  ) {
-
-    try {
-
-      const candidate =
-        await fetchManifestCandidate(
-
-          request,
-
-          state.upstreamUrl,
-
-          state.referer,
-
-          state.userAgent
-        );
-
-
-      if (
-        candidate.profile !==
-        state.profile
-      ) {
-
-        continue;
-      }
-
-
-      const urls =
-        extractManifestResources(
-
-          candidate.text,
-
-          candidate.finalUrl
-        );
-
-
-      for (
-        const candidateUrl
-        of urls
-      ) {
-
-        if (
-          resourceIdentity(
-            candidateUrl
-          ) === identity &&
-          candidateUrl !== failedUrl
-        ) {
-
-          return candidateUrl;
-        }
-      }
-
-    }
-
-    catch {
-      //
-    }
-  }
-
-
-  return null;
-}
-
-
-// ============================================================================
-// RESOURCE IDENTITY
-//
-// Different CDN hostname:
-//
-// h50.x/0021012254/918454578001/10889.pdf
-// h31.y/0021012254/918454578001/10889.pdf
-//
-// Same media resource.
-// ============================================================================
-
-function resourceIdentity(
-  value
-) {
-
-  try {
-
-    const url =
-      new URL(value);
-
-
-    const parts =
-      url.pathname
-        .split("/")
-        .filter(Boolean);
-
-
-    return parts
-      .slice(-2)
-      .join("/");
-
-  }
-
-  catch {
-
-    return null;
-  }
-}
-
-
-// ============================================================================
-// EXTRACT RESOURCE URLS
-// ============================================================================
-
-function extractManifestResources(
-  manifest,
-  manifestUrl
-) {
-
-  const base =
-    new URL(
-      manifestUrl
-    );
-
-
-  const result =
-    [];
-
-
-  for (
-    const line
-    of manifest.split(/\r?\n/)
-  ) {
-
-    const trimmed =
-      line.trim();
-
-
-    if (!trimmed) {
-      continue;
-    }
-
-
-    if (
-      !trimmed.startsWith("#")
-    ) {
-
-      try {
-
-        result.push(
-          inheritQuery(
-
-            new URL(
-              trimmed,
-              base
-            ),
-
-            base
-          ).href
-        );
-
-      }
-
-      catch {
-        //
-      }
-    }
-
-
-    const regex =
-      /URI=(["'])(.*?)\1/gi;
-
-
-    let match;
-
-
-    while (
-      (
-        match =
-          regex.exec(line)
-      ) !== null
-    ) {
-
-      try {
-
-        result.push(
-          inheritQuery(
-
-            new URL(
-              match[2],
-              base
-            ),
-
-            base
-          ).href
-        );
-
-      }
-
-      catch {
-        //
-      }
-    }
-  }
-
-
-  return result;
-}
-
-
-// ============================================================================
-// REWRITE MANIFEST
-// ============================================================================
-
-function rewriteManifest(
-
-  manifest,
-
-  manifestUrl,
-
-  origin,
-
-  sid,
-
-  state
-) {
-
-  const base =
-    new URL(
-      manifestUrl
-    );
-
-
-  return manifest
-    .split(/\r?\n/)
-    .map(
-      line => {
-
-        const trimmed =
-          line.trim();
-
-
-        if (!trimmed) {
-
-          return line;
-        }
-
-
-        // URI="..."
-        if (
-          trimmed.startsWith("#")
-        ) {
-
-          return line.replace(
-
-            /URI=(["'])(.*?)\1/gi,
-
-            (
-              whole,
-              quote,
-              value
-            ) => {
-
-              try {
-
-                const absolute =
-                  inheritQuery(
-
-                    new URL(
-                      value,
-                      base
-                    ),
-
-                    base
-                  ).href;
-
-
-                return (
-                  `URI=${quote}` +
-                  resourceWorkerUrl(
-                    origin,
-                    absolute,
-                    sid
-                  ) +
-                  `${quote}`
-                );
-
-              }
-
-              catch {
-
-                return whole;
-              }
-            }
-          );
-        }
-
-
-        try {
-
-          const absolute =
-            inheritQuery(
-
-              new URL(
-                trimmed,
-                base
-              ),
-
-              base
-            ).href;
-
-
-          return resourceWorkerUrl(
-
-            origin,
-
-            absolute,
-
-            sid
-          );
-
-        }
-
-        catch {
-
-          return line;
-        }
-      }
-    )
-    .join("\n");
-}
-
-
-// ============================================================================
-// RESOURCE WORKER URL
-// ============================================================================
-
-function resourceWorkerUrl(
-  origin,
-  upstream,
-  sid
-) {
-
-  const query =
-    new URLSearchParams();
-
-
-  query.set(
-    "u",
-    upstream
-  );
-
-
-  query.set(
-    "sid",
-    sid
-  );
-
-
-  return (
-    `${origin}/_resource?` +
-    query.toString()
-  );
-}
-
-
-// ============================================================================
-// RELATIVE QUERY INHERITANCE
-// ============================================================================
-
-function inheritQuery(
-  target,
-  parent
-) {
-
-  for (
-    const [key, value]
-    of parent.searchParams.entries()
-  ) {
-
-    if (
-      !target.searchParams.has(
-        key
-      )
-    ) {
-
-      target.searchParams.set(
-        key,
-        value
-      );
-    }
-  }
-
-
-  return target;
-}
-
-
-// ============================================================================
-// TARGET DURATION
-// ============================================================================
-
-function getTargetDuration(
-  manifest
-) {
-
-  const match =
-    manifest.match(
-      /#EXT-X-TARGETDURATION:(\d+)/i
-    );
-
-
-  return match
-    ? Number(match[1])
-    : 0;
-}
-
-
-// ============================================================================
-// MEDIA SEQUENCE
-// ============================================================================
-
-function getMediaSequence(
-  manifest
-) {
-
-  const match =
-    manifest.match(
-      /#EXT-X-MEDIA-SEQUENCE:(\d+)/i
-    );
-
-
-  return match
-    ? Number(match[1])
-    : 0;
-}
-
-
-// ============================================================================
-// SEGMENT FAMILY
-// ============================================================================
-
-function detectSegmentFamily(
-  manifest,
-  manifestUrl
-) {
-
-  const base =
-    new URL(
-      manifestUrl
-    );
-
-
-  const lines =
-    manifest.split(
-      /\r?\n/
-    );
-
-
-  for (
-    const line of lines
-  ) {
-
-    const value =
-      line.trim();
-
-
-    if (
-      !value ||
-      value.startsWith("#")
-    ) {
-
-      continue;
-    }
-
-
-    try {
-
-      const path =
-        new URL(
-          value,
-          base
-        )
-          .pathname
-          .toLowerCase();
-
-
-      const match =
-        path.match(
-          /\.([a-z0-9]+)$/
-        );
-
-
-      if (match) {
-
-        return match[1];
-      }
-
-    }
-
-    catch {
-      //
-    }
-  }
-
-
-  return "unknown";
-}
-
-
-// ============================================================================
-// TOKEN EXPIRY
-// ============================================================================
-
-function tokenNearExpiry(
-  value
-) {
-
-  try {
-
-    const url =
-      new URL(value);
-
-
-    const expiry =
-      Number(
-        url.searchParams.get("e")
-      );
-
-
-    if (
-      !Number.isFinite(expiry) ||
-      expiry <= 0
-    ) {
-
-      return false;
-    }
-
-
-    const now =
-      Math.floor(
-        Date.now() / 1000
-      );
-
-
-    return (
-      expiry -
-      now <=
-      CONFIG
-        .TOKEN_REFRESH_MARGIN_SECONDS
-    );
-
-  }
-
-  catch {
-
-    return false;
-  }
-}
-
-
-// ============================================================================
-// EDGE SESSION STORAGE
-// ============================================================================
-
-function stateRequest(
-  sid
-) {
-
-  return new Request(
-    `https://ycn-state.internal/session/${sid}`
-  );
-}
-
-
-function defaultSessionRequest(
-  channelId
-) {
-
-  return new Request(
-    `https://ycn-state.internal/channel/${channelId}`
-  );
-}
-
-
-async function saveSession(
-  state
-) {
-
-  const response =
-    new Response(
-
-      JSON.stringify(state),
-
-      {
-        headers: {
-
-          "Content-Type":
-            "application/json",
-
-          "Cache-Control":
-            `public, max-age=${CONFIG.SESSION_TTL_SECONDS}`
-        }
-      }
-    );
-
-
-  await caches.default.put(
-
-    stateRequest(
-      state.sid
-    ),
-
-    response
-  );
-}
-
-
-async function loadSession(
-  sid
-) {
-
-  const response =
-    await caches.default.match(
-      stateRequest(sid)
-    );
-
-
-  if (!response) {
-
-    return null;
-  }
-
-
-  try {
-
-    return await response.json();
-
-  }
-
-  catch {
-
-    return null;
-  }
-}
-
-
-async function saveDefaultSession(
-  channelId,
-  sid
-) {
-
-  await caches.default.put(
-
-    defaultSessionRequest(
-      channelId
-    ),
-
-    new Response(
-      sid,
-      {
-        headers: {
-
-          "Cache-Control":
-            `public, max-age=${CONFIG.SESSION_TTL_SECONDS}`,
-
-          "Content-Type":
-            "text/plain"
-        }
-      }
-    )
-  );
-}
-
-
-async function getDefaultSessionId(
-  channelId
-) {
-
-  const response =
-    await caches.default.match(
-
-      defaultSessionRequest(
-        channelId
-      )
-    );
-
-
-  if (!response) {
-
-    return null;
-  }
-
-
-  return (
-    await response.text()
-  ).trim();
-}
-
-
-// ============================================================================
-// FETCH WITH TIMEOUT
-// ============================================================================
-
-async function timedFetch(
-  url,
-  options,
-  timeout
-) {
-
-  const controller =
-    new AbortController();
-
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      timeout
-    );
-
-
-  try {
-
-    return await fetch(
-      url,
-      {
-        ...options,
-        signal:
-          controller.signal
-      }
-    );
-
-  }
-
-  finally {
-
-    clearTimeout(
-      timer
-    );
-  }
-}
-
-
-// ============================================================================
-// HEADERS
-// ============================================================================
-
-function upstreamHeaders(
-  request,
-  referer,
-  userAgent
-) {
-
-  const headers =
-    new Headers();
-
-
-  headers.set(
-    "Accept",
-    "*/*"
-  );
-
-
-  if (referer) {
-
-    headers.set(
-      "Referer",
-      referer
-    );
-  }
-
-
-  if (userAgent) {
-
-    headers.set(
-      "User-Agent",
-      userAgent
-    );
-  }
-
-
-  const range =
-    request.headers.get(
-      "Range"
-    );
-
-
-  if (range) {
-
-    headers.set(
-      "Range",
-      range
-    );
-  }
-
-
-  return headers;
-}
-
 
 function playlistHeaders() {
 
@@ -2753,47 +4205,11 @@ function playlistHeaders() {
       "no-cache",
 
     "Expires":
-      "0"
+      "0",
+
+    "X-Content-Type-Options":
+      "nosniff"
   });
-}
-
-
-// ============================================================================
-// MANIFEST DETECTION
-// ============================================================================
-
-function isManifest(
-  url,
-  type
-) {
-
-  const lower =
-    String(type || "")
-      .toLowerCase();
-
-
-  if (
-    lower.includes("mpegurl") ||
-    lower.includes("m3u")
-  ) {
-
-    return true;
-  }
-
-
-  try {
-
-    return new URL(url)
-      .pathname
-      .toLowerCase()
-      .endsWith(".m3u8");
-
-  }
-
-  catch {
-
-    return false;
-  }
 }
 
 
@@ -2801,8 +4217,10 @@ function isManifest(
 // CONTENT TYPE
 // ============================================================================
 
-function mediaContentType(
-  url,
+function detectContentType(
+
+  value,
+
   upstreamType
 ) {
 
@@ -2812,7 +4230,7 @@ function mediaContentType(
   try {
 
     path =
-      new URL(url)
+      new URL(value)
         .pathname
         .toLowerCase();
 
@@ -2824,7 +4242,20 @@ function mediaContentType(
 
 
   if (
+    path.endsWith(
+      ".m3u8"
+    )
+  ) {
+
+    return (
+      "application/vnd.apple.mpegurl"
+    );
+  }
+
+
+  if (
     path.endsWith(".ts") ||
+    path.endsWith(".mpegts") ||
     path.endsWith(".pdf") ||
     path.endsWith(".js")
   ) {
@@ -2835,8 +4266,8 @@ function mediaContentType(
 
   if (
     path.endsWith(".m4s") ||
-    path.endsWith(".mp4") ||
-    path.endsWith(".cmfv")
+    path.endsWith(".cmfv") ||
+    path.endsWith(".mp4")
   ) {
 
     return "video/mp4";
@@ -2844,7 +4275,19 @@ function mediaContentType(
 
 
   if (
-    path.endsWith(".aac")
+    path.endsWith(
+      ".cmfa"
+    )
+  ) {
+
+    return "audio/mp4";
+  }
+
+
+  if (
+    path.endsWith(
+      ".aac"
+    )
   ) {
 
     return "audio/aac";
@@ -2853,9 +4296,11 @@ function mediaContentType(
 
   if (
     upstreamType &&
-    !upstreamType
+    !String(upstreamType)
       .toLowerCase()
-      .includes("text/html")
+      .includes(
+        "text/html"
+      )
   ) {
 
     return upstreamType;
@@ -2867,10 +4312,59 @@ function mediaContentType(
 
 
 // ============================================================================
-// URL
+// MANIFEST TYPE
 // ============================================================================
 
-function checkUrl(
+function isManifestType(
+
+  value,
+
+  contentType
+) {
+
+  const type =
+    String(
+      contentType || ""
+    )
+      .toLowerCase();
+
+
+  if (
+    type.includes(
+      "mpegurl"
+    ) ||
+    type.includes(
+      "m3u"
+    )
+  ) {
+
+    return true;
+  }
+
+
+  try {
+
+    return new URL(value)
+      .pathname
+      .toLowerCase()
+      .endsWith(
+        ".m3u8"
+      );
+
+  }
+
+  catch {
+
+    return false;
+  }
+}
+
+
+// ============================================================================
+// URL VALIDATION
+// ============================================================================
+
+function validateHttpUrl(
   value
 ) {
 
@@ -2884,7 +4378,7 @@ function checkUrl(
   ) {
 
     throw new Error(
-      "Unsupported URL protocol"
+      "Unsupported upstream protocol"
     );
   }
 
@@ -2894,20 +4388,50 @@ function checkUrl(
 
 
 // ============================================================================
+// HOST
+// ============================================================================
+
+function safeHost(
+  value
+) {
+
+  try {
+
+    return new URL(
+      value
+    ).hostname;
+
+  }
+
+  catch {
+
+    return "";
+  }
+}
+
+
+// ============================================================================
 // COPY HEADER
 // ============================================================================
 
 function copyHeader(
+
   source,
+
   destination,
+
   name
 ) {
 
   const value =
-    source.get(name);
+    source.get(
+      name
+    );
 
 
-  if (value !== null) {
+  if (
+    value !== null
+  ) {
 
     destination.set(
       name,
@@ -2922,7 +4446,9 @@ function copyHeader(
 // ============================================================================
 
 function json(
+
   value,
+
   status = 200
 ) {
 
@@ -2935,6 +4461,7 @@ function json(
     ),
 
     {
+
       status,
 
       headers: {
@@ -2951,11 +4478,14 @@ function json(
 
 
 function errorJson(
+
   message,
+
   status = 500
 ) {
 
   return json(
+
     {
 
       ok:
@@ -2965,7 +4495,7 @@ function errorJson(
         message,
 
       version:
-        "5.0"
+        "6.0"
     },
 
     status
@@ -2989,7 +4519,7 @@ function cors(
 
   headers.set(
     "Access-Control-Allow-Origin",
-    CONFIG.CORS_ORIGIN
+    CONFIG.CORS
   );
 
 
@@ -3007,7 +4537,10 @@ function cors(
 
   headers.set(
     "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges, X-YCN-Version, X-YCN-Profile, X-YCN-Sequence"
+
+    "Content-Length, Content-Range, Accept-Ranges, " +
+
+    "X-YCN-Version, X-YCN-Profile, X-YCN-Sequence, X-YCN-Cache"
   );
 
 
