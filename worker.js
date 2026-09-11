@@ -1,3065 +1,3069 @@
-// ============================================================================
-// YCN HIGH-SCALE LIVE HLS GATEWAY
-// Cloudflare Worker - SINGLE FILE
+// ============================================================
+// Drama Live Gateway
+// Cloudflare Worker - Single File
 //
-// VERSION: 6.1 STABILITY EDITION
-//
-// Main fixes over v6.0:
-// - Normalize disguised MPEG-TS segments (.pdf / .js / .ts) to video/mp2t
-// - Always advertise Accept-Ranges: bytes on media responses
-// - Preserve correct 206 / Content-Range / Content-Length semantics
-// - Normalize cached segment responses before returning to clients
-// - Add diagnostic headers
-// - Keep timeline lock / segment cache / request coalescing / retry logic
-// ============================================================================
-
-
-// ============================================================================
-// CONFIG
-// ============================================================================
+// API + AES-CBC + Resolver + HLS Proxy + Browser Player
+// ============================================================
 
 const CONFIG = {
-  API_BASE: "https://def.ycnapi.com/api",
+  LIVE_API_BASE:
+    "http://live.sepdatabridge.site/api/live/livedrama/v13.0.0",
 
-  STATIC_KEY: "c!xZj+N9&G@Ev@vw",
+  REDIRECT_API_BASE:
+    "http://redirect.sepdatabridge.site/redirect",
 
-  API_UA: "okhttp/4.12.0",
+  AES_KEY: "0123456789abcdef",
+  AES_IV: "fedcba9876543210",
 
-  DEFAULT_REFERER: "https://x.com/",
+  APP_VERSION: "186",
+  DEVICE_API: "36",
+  LANGUAGE: "ar",
+  TIMEZONE: "Asia/Baghdad",
+  DEVICE_TYPE: "phone",
+  STORE: "playStore",
+  KEY_ACTIVATED_TYPE: "202122",
 
-  DEFAULT_PLAYER_UA:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-    "AppleWebKit/537.36 (KHTML, like Gecko) " +
-    "Chrome/139.0.0.0 Safari/537.36",
+  // Cache inside current Worker isolate only.
+  API_CACHE_MS: 12000,
+  RESOLVE_CACHE_MS: 12000,
 
-  DEFAULT_CATEGORY: 4,
+  // Upstream timeouts
+  API_TIMEOUT: 15000,
+  MANIFEST_TIMEOUT: 12000,
+  RESOURCE_TIMEOUT: 20000,
 
-  LIVE_MANIFEST_TTL: 1,
-  PLAYBACK_TTL: 45,
-  CATEGORY_TTL: 300,
-  SEGMENT_CACHE_TTL: 180,
-  GENERIC_RESOURCE_TTL: 15,
-  LOCK_TTL: 21600,
+  MAX_REDIRECT_DEPTH: 3,
 
-  API_TIMEOUT_MS: 7000,
-  MANIFEST_TIMEOUT_MS: 5000,
-  SEGMENT_TIMEOUT_MS: 9000,
-  GENERIC_TIMEOUT_MS: 9000,
-
-  MANIFEST_ATTEMPTS: 4,
-  INITIAL_PROFILE_SAMPLES: 4,
-  SEGMENT_ATTEMPTS: 3,
-  ALTERNATIVE_LOOKUPS: 2,
-
-  TOKEN_REFRESH_MARGIN: 120,
-
-  CORS: "*",
+  DEFAULT_UA:
+    "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
 };
 
 
-// ============================================================================
-// L1 / INFLIGHT
-// ============================================================================
+// ============================================================
+// MEMORY CACHE
+// ============================================================
 
-const L1_MANIFEST = new Map();
-const L1_PLAYBACK = new Map();
-const INFLIGHT = new Map();
+const apiCache = new Map();
+const resolveCache = new Map();
 
+function cacheGet(map, key, ttl) {
+  const item = map.get(key);
 
-// ============================================================================
-// ENTRY
-// ============================================================================
+  if (!item) return null;
 
-export default {
-  async fetch(request, env, ctx) {
-    try {
-      if (request.method === "OPTIONS") {
-        return cors(
-          new Response(null, {
-            status: 204,
-          })
-        );
-      }
-
-      if (
-        request.method !== "GET" &&
-        request.method !== "HEAD"
-      ) {
-        return cors(
-          errorJson("Method not allowed", 405)
-        );
-      }
-
-      const url = new URL(request.url);
-
-      const path = url.pathname
-        .replace(/^\/+/, "")
-        .replace(/\/+$/, "");
-
-      if (!path) {
-        return cors(
-          json({
-            ok: true,
-            service: "YCN High Scale Gateway",
-            version: "6.1",
-            mode:
-              "timeline-lock + shared-manifest + normalized-segment-cache",
-            routes: {
-              categories: "/categories",
-              category: "/category/4",
-              numeric: "/1",
-              channel: "/c/1424",
-              live: "/live/1424.m3u8",
-            },
-          })
-        );
-      }
-
-      if (path === "categories") {
-        const categories = await getCategories();
-
-        return cors(
-          json({
-            ok: true,
-            count: categories.length,
-            categories,
-          })
-        );
-      }
-
-      if (path.startsWith("category/")) {
-        const categoryId = path.substring(
-          "category/".length
-        );
-
-        const channels =
-          await getCategoryChannels(categoryId);
-
-        return cors(
-          json({
-            ok: true,
-            category_id: categoryId,
-            count: channels.length,
-            channels: channels.map(
-              (channel, index) => ({
-                number: index + 1,
-                direct: `/c/${channel.id}`,
-                live: `/live/${channel.id}.m3u8`,
-                ...channel,
-              })
-            ),
-          })
-        );
-      }
-
-      if (path.startsWith("c/")) {
-        let channelId = path.substring(2);
-
-        channelId = channelId.replace(
-          /\.m3u8$/i,
-          ""
-        );
-
-        return Response.redirect(
-          `${url.origin}/live/${encodeURIComponent(
-            channelId
-          )}.m3u8`,
-          302
-        );
-      }
-
-      if (path.startsWith("live/")) {
-        let channelId = path.substring(
-          "live/".length
-        );
-
-        channelId = channelId.replace(
-          /\.m3u8$/i,
-          ""
-        );
-
-        if (!channelId) {
-          return cors(
-            errorJson(
-              "Missing channel ID",
-              400
-            )
-          );
-        }
-
-        return await liveRoute(
-          request,
-          channelId
-        );
-      }
-
-      if (path === "_r") {
-        return await resourceRoute(request);
-      }
-
-      if (/^\d+$/.test(path)) {
-        const number = Number(path);
-
-        const channels =
-          await getCategoryChannels(
-            CONFIG.DEFAULT_CATEGORY
-          );
-
-        if (
-          number < 1 ||
-          number > channels.length
-        ) {
-          return cors(
-            errorJson(
-              "Invalid channel number",
-              404
-            )
-          );
-        }
-
-        const channel =
-          channels[number - 1];
-
-        return Response.redirect(
-          `${url.origin}/live/${encodeURIComponent(
-            channel.id
-          )}.m3u8`,
-          302
-        );
-      }
-
-      return cors(
-        errorJson("Route not found", 404)
-      );
-    } catch (error) {
-      console.log(
-        "WORKER ERROR:",
-        error?.message || String(error)
-      );
-
-      return cors(
-        errorJson(
-          error?.message || String(error),
-          500
-        )
-      );
-    }
-  },
-};
-
-
-// ============================================================================
-// LIVE
-// ============================================================================
-
-async function liveRoute(
-  request,
-  channelId
-) {
-  const item =
-    await getSharedManifest(channelId);
-
-  const origin = new URL(
-    request.url
-  ).origin;
-
-  const rewritten =
-    await rewriteManifest(
-      item.text,
-      item.finalUrl,
-      origin,
-      channelId,
-      item.profile
-    );
-
-  const headers =
-    playlistHeaders();
-
-  headers.set(
-    "X-YCN-Version",
-    "6.1"
-  );
-
-  headers.set(
-    "X-YCN-Profile",
-    item.profile
-  );
-
-  headers.set(
-    "X-YCN-Sequence",
-    String(item.sequence)
-  );
-
-  headers.set(
-    "X-YCN-Shared",
-    "1"
-  );
-
-  if (request.method === "HEAD") {
-    return cors(
-      new Response(null, {
-        status: 200,
-        headers,
-      })
-    );
+  if (Date.now() - item.time > ttl) {
+    map.delete(key);
+    return null;
   }
 
-  return cors(
-    new Response(rewritten, {
-      status: 200,
-      headers,
-    })
-  );
+  return item.value;
+}
+
+function cacheSet(map, key, value) {
+  map.set(key, {
+    time: Date.now(),
+    value,
+  });
+
+  // Prevent unlimited growth in long-lived isolates.
+  if (map.size > 500) {
+    const first = map.keys().next().value;
+    if (first) map.delete(first);
+  }
 }
 
 
-// ============================================================================
-// SHARED MANIFEST
-// ============================================================================
+// ============================================================
+// BASIC HELPERS
+// ============================================================
 
-async function getSharedManifest(
-  channelId,
-  force = false
-) {
-  const now = Date.now();
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
-  if (!force) {
-    const l1 =
-      L1_MANIFEST.get(channelId);
-
-    if (
-      l1 &&
-      l1.expires > now
-    ) {
-      return l1.value;
-    }
-  }
-
-  const cacheKey =
-    internalRequest(
-      `manifest/${channelId}`
+function randomUUID() {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return (
+      Date.now().toString(36) +
+      Math.random().toString(36).slice(2) +
+      Math.random().toString(36).slice(2)
     );
-
-  if (!force) {
-    try {
-      const cached =
-        await caches.default.match(
-          cacheKey
-        );
-
-      if (cached) {
-        const value =
-          await cached.json();
-
-        L1_MANIFEST.set(
-          channelId,
-          {
-            expires: now + 900,
-            value,
-          }
-        );
-
-        return value;
-      }
-    } catch {}
   }
-
-  return await dedupe(
-    `manifest:${channelId}`,
-    async () => {
-      if (!force) {
-        try {
-          const again =
-            await caches.default.match(
-              cacheKey
-            );
-
-          if (again) {
-            return await again.json();
-          }
-        } catch {}
-      }
-
-      const value =
-        await buildLockedManifest(
-          channelId
-        );
-
-      L1_MANIFEST.set(
-        channelId,
-        {
-          expires:
-            Date.now() + 900,
-          value,
-        }
-      );
-
-      try {
-        await putJsonCache(
-          cacheKey,
-          value,
-          CONFIG.LIVE_MANIFEST_TTL
-        );
-      } catch {}
-
-      return value;
-    }
-  );
 }
 
+const DEVICE_ID = randomUUID();
 
-// ============================================================================
-// LOCKED MANIFEST
-// ============================================================================
-
-async function buildLockedManifest(
-  channelId
-) {
-  let playback =
-    await getPlaybackInfo(channelId);
-
-  let lock =
-    await getTimelineLock(channelId);
-
-  if (!lock) {
-    const samples = [];
-
-    for (
-      let i = 0;
-      i <
-      CONFIG.INITIAL_PROFILE_SAMPLES;
-      i++
-    ) {
-      try {
-        const candidate =
-          await fetchManifestCandidate(
-            playback
-          );
-
-        samples.push(candidate);
-      } catch {}
-    }
-
-    if (!samples.length) {
-      playback =
-        await getPlaybackInfo(
-          channelId,
-          true
-        );
-
-      samples.push(
-        await fetchManifestCandidate(
-          playback
-        )
-      );
-    }
-
-    const selected =
-      chooseProfile(samples);
-
-    lock = {
-      channelId:
-        String(channelId),
-
-      profile:
-        selected.profile,
-
-      lastSequence:
-        selected.sequence,
-
-      lastText:
-        selected.text,
-
-      lastUrl:
-        selected.finalUrl,
-
-      lastGoodAt:
-        Date.now(),
-    };
-
-    await saveTimelineLock(
-      channelId,
-      lock
-    );
-
-    return selected;
-  }
-
-  if (
-    tokenNearExpiry(
-      playback.url
-    )
-  ) {
-    playback =
-      await getPlaybackInfo(
-        channelId,
-        true
-      );
-  }
-
-  let best = null;
-
-  for (
-    let attempt = 0;
-    attempt <
-    CONFIG.MANIFEST_ATTEMPTS;
-    attempt++
-  ) {
-    try {
-      const candidate =
-        await fetchManifestCandidate(
-          playback
-        );
-
-      if (
-        candidate.profile !==
-        lock.profile
-      ) {
-        continue;
-      }
-
-      if (
-        candidate.sequence <
-        lock.lastSequence
-      ) {
-        continue;
-      }
-
-      if (
-        !best ||
-        candidate.sequence >
-          best.sequence
-      ) {
-        best = candidate;
-      }
-    } catch {}
-  }
-
-  if (!best) {
-    try {
-      playback =
-        await getPlaybackInfo(
-          channelId,
-          true
-        );
-
-      for (
-        let attempt = 0;
-        attempt < 4;
-        attempt++
-      ) {
-        try {
-          const candidate =
-            await fetchManifestCandidate(
-              playback
-            );
-
-          if (
-            candidate.profile ===
-              lock.profile &&
-            candidate.sequence >=
-              lock.lastSequence
-          ) {
-            best = candidate;
-            break;
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  if (
-    !best &&
-    lock.lastText
-  ) {
-    return {
-      text:
-        lock.lastText,
-
-      finalUrl:
-        lock.lastUrl,
-
-      sequence:
-        lock.lastSequence,
-
-      targetDuration:
-        getTargetDuration(
-          lock.lastText
-        ),
-
-      profile:
-        lock.profile,
-    };
-  }
-
-  if (!best) {
-    throw new Error(
-      "Locked HLS timeline unavailable"
-    );
-  }
-
-  lock.lastSequence =
-    best.sequence;
-
-  lock.lastText =
-    best.text;
-
-  lock.lastUrl =
-    best.finalUrl;
-
-  lock.lastGoodAt =
-    Date.now();
-
-  await saveTimelineLock(
-    channelId,
-    lock
-  );
-
-  return best;
+function makeUserId() {
+  return `_41810_${Date.now()}_notloggedin.com_dramalive3`;
 }
 
-
-// ============================================================================
-// FETCH MANIFEST
-// ============================================================================
-
-async function fetchManifestCandidate(
-  playback
-) {
-  const headers =
-    new Headers();
-
-  headers.set(
-    "Accept",
-    "*/*"
-  );
-
-  headers.set(
-    "Cache-Control",
-    "no-cache"
-  );
-
-  headers.set(
-    "Pragma",
-    "no-cache"
-  );
-
-  if (playback.referer) {
-    headers.set(
-      "Referer",
-      playback.referer
-    );
-  }
-
-  if (playback.userAgent) {
-    headers.set(
-      "User-Agent",
-      playback.userAgent
-    );
-  }
-
-  const response =
-    await timedFetch(
-      playback.url,
-      {
-        method: "GET",
-        headers,
-        redirect: "follow",
-      },
-      CONFIG.MANIFEST_TIMEOUT_MS
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `Manifest HTTP ${response.status}`
-    );
-  }
-
-  const text =
-    await response.text();
-
-  if (
-    !text
-      .trimStart()
-      .startsWith("#EXTM3U")
-  ) {
-    throw new Error(
-      "Not an HLS playlist"
-    );
-  }
-
-  const finalUrl =
-    response.url ||
-    playback.url;
-
-  const sequence =
-    getMediaSequence(text);
-
-  const targetDuration =
-    getTargetDuration(text);
-
-  const family =
-    detectResourceFamily(
-      text,
-      finalUrl
-    );
-
-  return {
-    text,
-    finalUrl,
-    sequence,
-    targetDuration,
-    profile:
-      `${targetDuration}|${family}`,
-  };
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+      "Cache-Control": "no-store",
+      ...extraHeaders,
+    },
+  });
 }
 
-
-// ============================================================================
-// PROFILE
-// ============================================================================
-
-function chooseProfile(samples) {
-  const groups = new Map();
-
-  for (const sample of samples) {
-    if (
-      !groups.has(
-        sample.profile
-      )
-    ) {
-      groups.set(
-        sample.profile,
-        []
-      );
-    }
-
-    groups
-      .get(sample.profile)
-      .push(sample);
-  }
-
-  let winner = null;
-
-  for (
-    const group
-    of groups.values()
-  ) {
-    group.sort(
-      (a, b) =>
-        b.sequence -
-        a.sequence
-    );
-
-    if (
-      !winner ||
-      group.length >
-        winner.length
-    ) {
-      winner = group;
-      continue;
-    }
-
-    if (
-      group.length ===
-      winner.length
-    ) {
-      const a =
-        group[0]
-          .targetDuration ||
-        999;
-
-      const b =
-        winner[0]
-          .targetDuration ||
-        999;
-
-      if (a < b) {
-        winner = group;
-      }
-    }
-  }
-
-  return winner[0];
+function textResponse(text, status = 200, contentType = "text/plain; charset=utf-8") {
+  return new Response(text, {
+    status,
+    headers: {
+      "Content-Type": contentType,
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
-
-// ============================================================================
-// RESOURCE ROUTE
-// ============================================================================
-
-async function resourceRoute(
-  request
-) {
-  const workerUrl =
-    new URL(request.url);
-
-  const upstreamUrl =
-    workerUrl.searchParams.get(
-      "u"
-    );
-
-  const channelId =
-    workerUrl.searchParams.get(
-      "cid"
-    );
-
-  const profile =
-    workerUrl.searchParams.get(
-      "p"
-    ) || "default";
-
-  if (
-    !upstreamUrl ||
-    !channelId
-  ) {
-    return cors(
-      errorJson(
-        "Invalid resource request",
-        400
-      )
-    );
-  }
-
-  validateHttpUrl(
-    upstreamUrl
-  );
-
-  const playback =
-    await getPlaybackInfo(
-      channelId
-    );
-
-  if (
-    isLikelyMediaSegment(
-      upstreamUrl
-    )
-  ) {
-    return await serveMediaSegment(
-      request,
-      channelId,
-      profile,
-      upstreamUrl,
-      playback
-    );
-  }
-
-  return await serveGenericResource(
-    request,
-    channelId,
-    profile,
-    upstreamUrl,
-    playback
-  );
-}
-
-
-// ============================================================================
-// MEDIA SEGMENT
-// ============================================================================
-
-async function serveMediaSegment(
-  request,
-  channelId,
-  profile,
-  upstreamUrl,
-  playback
-) {
-  const canonical =
-    canonicalMediaIdentity(
-      upstreamUrl
-    );
-
-  const cacheKey =
-    internalRequest(
-      `segment/${encodeURIComponent(
-        channelId
-      )}/` +
-        `${encodeURIComponent(
-          profile
-        )}/` +
-        encodeURIComponent(
-          canonical
-        )
-    );
-
-  const hit =
-    await matchWithRange(
-      cacheKey,
-      request
-    );
-
-  if (hit) {
-    return normalizedMediaResponse(
-      request,
-      hit,
-      upstreamUrl,
-      "HIT"
-    );
-  }
-
-  await dedupe(
-    `seg:${channelId}:${profile}:${canonical}`,
-    async () => {
-      const secondCheck =
-        await caches.default.match(
-          cacheKey
-        );
-
-      if (secondCheck) {
-        return true;
-      }
-
-      const result =
-        await fetchSegmentWithRecovery(
-          channelId,
-          profile,
-          upstreamUrl,
-          playback
-        );
-
-      if (!result) {
-        return false;
-      }
-
-      const cacheable =
-        normalizeForCache(
-          result.response
-        );
-
-      if (!cacheable) {
-        return false;
-      }
-
-      const headers =
-        new Headers(
-          cacheable.headers
-        );
-
-      headers.delete(
-        "Set-Cookie"
-      );
-
-      headers.delete(
-        "Content-Range"
-      );
-
-      if (
-        headers.get("Vary") ===
-        "*"
-      ) {
-        headers.delete("Vary");
-      }
-
-      const mediaType =
-        detectContentType(
-          result.finalUrl,
-          headers.get(
-            "Content-Type"
-          ) || ""
-        );
-
-      headers.set(
-        "Content-Type",
-        mediaType
-      );
-
-      headers.set(
-        "Accept-Ranges",
-        "bytes"
-      );
-
-      headers.set(
-        "Cache-Control",
-        `public, max-age=${CONFIG.SEGMENT_CACHE_TTL}`
-      );
-
-      headers.set(
-        "X-YCN-Origin-Host",
-        safeHost(
-          result.finalUrl
-        )
-      );
-
-      headers.set(
-        "X-YCN-Segment-Type",
-        segmentTypeLabel(
-          result.finalUrl
-        )
-      );
-
-      const stored =
-        new Response(
-          cacheable.body,
-          {
-            status: 200,
-            headers,
-          }
-        );
-
-      try {
-        await caches.default.put(
-          cacheKey,
-          stored
-        );
-
-        return true;
-      } catch (error) {
-        console.log(
-          "SEGMENT CACHE PUT FAILED:",
-          error?.message ||
-            String(error)
-        );
-
-        return false;
-      }
-    }
-  );
-
-  const after =
-    await matchWithRange(
-      cacheKey,
-      request
-    );
-
-  if (after) {
-    return normalizedMediaResponse(
-      request,
-      after,
-      upstreamUrl,
-      "MISS-FILLED"
-    );
-  }
-
-  const direct =
-    await fetchSegmentWithRecovery(
-      channelId,
-      profile,
-      upstreamUrl,
-      playback
-    );
-
-  if (!direct) {
-    return cors(
-      new Response(
-        "Upstream segment unavailable",
-        {
-          status: 504,
-          headers: {
-            "Content-Type":
-              "text/plain; charset=utf-8",
-
-            "Cache-Control":
-              "no-store",
-
-            "X-YCN-Cache":
-              "FAIL",
-          },
-        }
-      )
-    );
-  }
-
-  return normalizedMediaResponse(
-    request,
-    direct.response,
-    direct.finalUrl,
-    "BYPASS"
-  );
-}
-
-
-// ============================================================================
-// NORMALIZED MEDIA RESPONSE
-// ============================================================================
-
-function normalizedMediaResponse(
-  request,
-  response,
-  sourceUrl,
-  cacheStatus
-) {
-  const headers =
-    new Headers(
-      response.headers
-    );
-
-  const originalType =
-    headers.get(
-      "Content-Type"
-    ) || "";
-
-  const normalizedType =
-    detectContentType(
-      sourceUrl,
-      originalType
-    );
-
-  headers.set(
-    "Content-Type",
-    normalizedType
-  );
-
-  headers.set(
-    "Accept-Ranges",
-    "bytes"
-  );
-
-  headers.set(
-    "X-YCN-Version",
-    "6.1"
-  );
-
-  headers.set(
-    "X-YCN-Cache",
-    cacheStatus
-  );
-
-  headers.set(
-    "X-YCN-Original-Type",
-    originalType || "-"
-  );
-
-  headers.set(
-    "X-YCN-Segment-Type",
-    segmentTypeLabel(
-      sourceUrl
-    )
-  );
-
-  headers.set(
-    "Access-Control-Allow-Origin",
-    CONFIG.CORS
-  );
-
-  headers.set(
-    "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges, " +
-      "X-YCN-Version, X-YCN-Cache, X-YCN-Original-Type, X-YCN-Segment-Type"
-  );
-
-  if (
-    response.status === 206
-  ) {
-    const contentRange =
-      headers.get(
-        "Content-Range"
-      );
-
-    if (!contentRange) {
-      console.log(
-        "WARNING: 206 without Content-Range"
-      );
-    }
-  }
-
-  return new Response(
-    request.method === "HEAD"
-      ? null
-      : response.body,
+function errorResponse(error, status = 500) {
+  return jsonResponse(
     {
-      status:
-        response.status,
-
-      statusText:
-        response.statusText,
-
-      headers,
-    }
+      ok: false,
+      error: String(error?.message || error || "Unknown error"),
+    },
+    status
   );
 }
 
-
-// ============================================================================
-// SEGMENT RECOVERY
-// ============================================================================
-
-async function fetchSegmentWithRecovery(
-  channelId,
-  profile,
-  originalUrl,
-  playback
-) {
-  let currentUrl =
-    originalUrl;
-
-  let currentPlayback =
-    playback;
-
-  for (
-    let attempt = 0;
-    attempt <
-    CONFIG.SEGMENT_ATTEMPTS;
-    attempt++
-  ) {
-    try {
-      const response =
-        await timedFetch(
-          currentUrl,
-          {
-            method: "GET",
-
-            headers:
-              originHeaders(
-                currentPlayback,
-                false
-              ),
-
-            redirect:
-              "follow",
-          },
-          CONFIG.SEGMENT_TIMEOUT_MS
-        );
-
-      if (response.ok) {
-        return {
-          response,
-          finalUrl:
-            response.url ||
-            currentUrl,
-        };
-      }
-
-      try {
-        response.body?.cancel();
-      } catch {}
-    } catch {}
-
-    const alternative =
-      await findAlternativeResource(
-        channelId,
-        profile,
-        currentUrl
-      );
-
-    if (
-      alternative &&
-      alternative !==
-        currentUrl
-    ) {
-      currentUrl =
-        alternative;
-
-      continue;
-    }
-
-    try {
-      currentPlayback =
-        await getPlaybackInfo(
-          channelId,
-          true
-        );
-    } catch {}
-  }
-
-  return null;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-
-// ============================================================================
-// ALTERNATIVE RESOURCE
-// ============================================================================
-
-async function findAlternativeResource(
-  channelId,
-  profile,
-  failedUrl
-) {
-  const wanted =
-    canonicalMediaIdentity(
-      failedUrl
-    );
-
-  for (
-    let attempt = 0;
-    attempt <
-    CONFIG.ALTERNATIVE_LOOKUPS;
-    attempt++
-  ) {
-    try {
-      const manifest =
-        await getSharedManifest(
-          channelId,
-          true
-        );
-
-      if (
-        manifest.profile !==
-        profile
-      ) {
-        continue;
-      }
-
-      const resources =
-        extractResources(
-          manifest.text,
-          manifest.finalUrl
-        );
-
-      for (const url of resources) {
-        if (
-          canonicalMediaIdentity(
-            url
-          ) === wanted &&
-          url !== failedUrl
-        ) {
-          return url;
-        }
-      }
-    } catch {}
-  }
-
-  return null;
-}
-
-
-// ============================================================================
-// GENERIC RESOURCE
-// ============================================================================
-
-async function serveGenericResource(
-  request,
-  channelId,
-  profile,
-  upstreamUrl,
-  playback
-) {
-  const key =
-    internalRequest(
-      `generic/${encodeURIComponent(
-        channelId
-      )}/` +
-        encodeURIComponent(
-          upstreamUrl
-        )
-    );
-
-  const cached =
-    await matchWithRange(
-      key,
-      request
-    );
-
-  if (cached) {
-    const type =
-      cached.headers.get(
-        "Content-Type"
-      ) || "";
-
-    if (
-      isManifestType(
-        upstreamUrl,
-        type
-      )
-    ) {
-      const text =
-        await cached.text();
-
-      const rewritten =
-        await rewriteManifest(
-          text,
-          upstreamUrl,
-          new URL(
-            request.url
-          ).origin,
-          channelId,
-          profile
-        );
-
-      return cors(
-        new Response(
-          rewritten,
-          {
-            status: 200,
-            headers:
-              playlistHeaders(),
-          }
-        )
-      );
-    }
-
-    return normalizedMediaResponse(
-      request,
-      cached,
-      upstreamUrl,
-      "GENERIC-HIT"
-    );
-  }
-
-  let response;
-
+function safeJSON(value) {
   try {
-    response =
-      await timedFetch(
-        upstreamUrl,
-        {
-          method: "GET",
-
-          headers:
-            originHeaders(
-              playback,
-              false
-            ),
-
-          redirect:
-            "follow",
-        },
-        CONFIG.GENERIC_TIMEOUT_MS
-      );
+    const x = JSON.parse(value);
+    return x && typeof x === "object" ? x : null;
   } catch {
-    return cors(
-      new Response(
-        "Upstream timeout",
-        {
-          status: 504,
-        }
-      )
-    );
+    return null;
   }
+}
 
-  if (!response.ok) {
-    return cors(
-      new Response(
-        `Upstream HTTP ${response.status}`,
-        {
-          status:
-            response.status,
-        }
-      )
-    );
-  }
-
-  const finalUrl =
-    response.url ||
-    upstreamUrl;
-
-  const contentType =
-    response.headers.get(
-      "Content-Type"
-    ) || "";
-
-  if (
-    isManifestType(
-      finalUrl,
-      contentType
-    )
-  ) {
-    const text =
-      await response.text();
-
-    if (
-      text
-        .trimStart()
-        .startsWith(
-          "#EXTM3U"
-        )
-    ) {
-      const rewritten =
-        await rewriteManifest(
-          text,
-          finalUrl,
-          new URL(
-            request.url
-          ).origin,
-          channelId,
-          profile
-        );
-
-      return cors(
-        new Response(
-          request.method ===
-          "HEAD"
-            ? null
-            : rewritten,
-          {
-            status: 200,
-            headers:
-              playlistHeaders(),
-          }
-        )
-      );
-    }
-  }
-
-  const cacheable =
-    normalizeForCache(
-      response
-    );
-
-  if (cacheable) {
-    const headers =
-      new Headers(
-        cacheable.headers
-      );
-
-    headers.delete(
-      "Set-Cookie"
-    );
-
-    headers.delete(
-      "Content-Range"
-    );
-
-    if (
-      headers.get("Vary") ===
-      "*"
-    ) {
-      headers.delete("Vary");
-    }
-
-    const normalizedType =
-      detectContentType(
-        finalUrl,
-        headers.get(
-          "Content-Type"
-        ) || ""
-      );
-
-    headers.set(
-      "Content-Type",
-      normalizedType
-    );
-
-    headers.set(
-      "Accept-Ranges",
-      "bytes"
-    );
-
-    headers.set(
-      "Cache-Control",
-      `public, max-age=${CONFIG.GENERIC_RESOURCE_TTL}`
-    );
-
-    try {
-      await caches.default.put(
-        key,
-        new Response(
-          cacheable.body,
-          {
-            status: 200,
-            headers,
-          }
-        )
-      );
-
-      const stored =
-        await matchWithRange(
-          key,
-          request
-        );
-
-      if (stored) {
-        return normalizedMediaResponse(
-          request,
-          stored,
-          finalUrl,
-          "GENERIC-FILLED"
-        );
-      }
-    } catch {}
-  }
-
-  return normalizedMediaResponse(
-    request,
-    response,
-    finalUrl,
-    "GENERIC-BYPASS"
-  );
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || ""));
 }
 
 
-// ============================================================================
-// CACHE NORMALIZATION
-// ============================================================================
+// ============================================================
+// BASE64
+// ============================================================
 
-function normalizeForCache(
-  response
-) {
-  if (
-    response.status === 200
-  ) {
-    return new Response(
-      response.body,
-      {
-        status: 200,
-        headers:
-          new Headers(
-            response.headers
-          ),
-      }
+function bytesToBase64(bytes) {
+  let binary = "";
+
+  const chunk = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(i, Math.min(i + chunk, bytes.length))
     );
   }
 
-  if (
-    response.status !== 206
-  ) {
-    return null;
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const clean = String(value || "").replace(/\s+/g, "");
+  const binary = atob(clean);
+
+  const out = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
   }
 
-  const contentRange =
-    response.headers.get(
-      "Content-Range"
-    );
+  return out;
+}
 
-  if (!contentRange) {
-    return null;
+function encodeBase64Url(text) {
+  return bytesToBase64(textEncoder.encode(text))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function decodeBase64Url(value) {
+  value = String(value || "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+  while (value.length % 4) {
+    value += "=";
   }
 
-  const match =
-    contentRange.match(
-      /^bytes\s+0-(\d+)\/(\d+)$/i
-    );
+  return textDecoder.decode(base64ToBytes(value));
+}
 
-  if (!match) {
-    return null;
-  }
 
-  const end =
-    Number(match[1]);
+// ============================================================
+// AES-CBC
+// ============================================================
 
-  const total =
-    Number(match[2]);
+let importedAesKey = null;
 
-  if (
-    !Number.isFinite(end) ||
-    !Number.isFinite(total)
-  ) {
-    return null;
-  }
+async function getAesKey() {
+  if (importedAesKey) return importedAesKey;
 
-  if (
-    end + 1 !== total
-  ) {
-    return null;
-  }
-
-  const headers =
-    new Headers(
-      response.headers
-    );
-
-  headers.delete(
-    "Content-Range"
-  );
-
-  headers.set(
-    "Content-Length",
-    String(total)
-  );
-
-  headers.set(
-    "Accept-Ranges",
-    "bytes"
-  );
-
-  return new Response(
-    response.body,
+  importedAesKey = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(CONFIG.AES_KEY),
     {
-      status: 200,
-      headers,
-    }
+      name: "AES-CBC",
+    },
+    false,
+    ["encrypt", "decrypt"]
   );
+
+  return importedAesKey;
 }
 
+async function encryptPayload(data) {
+  const key = await getAesKey();
 
-// ============================================================================
-// RANGE CACHE MATCH
-// ============================================================================
+  const iv = textEncoder.encode(CONFIG.AES_IV);
 
-async function matchWithRange(
-  key,
-  clientRequest
-) {
-  try {
-    const range =
-      clientRequest.headers.get(
-        "Range"
-      );
-
-    if (!range) {
-      return await caches.default.match(
-        key
-      );
-    }
-
-    const rangeRequest =
-      new Request(
-        key.url,
-        {
-          method: "GET",
-          headers: {
-            Range: range,
-          },
-        }
-      );
-
-    return await caches.default.match(
-      rangeRequest
-    );
-  } catch {
-    return null;
-  }
-}
-
-
-// ============================================================================
-// PLAYBACK INFO
-// ============================================================================
-
-async function getPlaybackInfo(
-  channelId,
-  force = false
-) {
-  const now = Date.now();
-
-  if (!force) {
-    const l1 =
-      L1_PLAYBACK.get(
-        channelId
-      );
-
-    if (
-      l1 &&
-      l1.expires > now
-    ) {
-      return l1.value;
-    }
-  }
-
-  const key =
-    internalRequest(
-      `playback/${channelId}`
-    );
-
-  if (!force) {
-    try {
-      const cached =
-        await caches.default.match(
-          key
-        );
-
-      if (cached) {
-        const value =
-          await cached.json();
-
-        L1_PLAYBACK.set(
-          channelId,
-          {
-            expires:
-              now + 15000,
-            value,
-          }
-        );
-
-        return value;
-      }
-    } catch {}
-  }
-
-  return await dedupe(
-    `playback:${channelId}`,
-    async () => {
-      const payload =
-        normalize(
-          await apiFetch(
-            `channel/${encodeURIComponent(
-              channelId
-            )}`
-          )
-        );
-
-      let data = payload;
-
-      if (
-        Array.isArray(data)
-      ) {
-        data =
-          data.find(
-            (item) =>
-              item &&
-              (
-                item.url ||
-                item.stream_url ||
-                item.link
-              )
-          ) ||
-          data[0];
-      }
-
-      if (
-        !data ||
-        typeof data !==
-          "object"
-      ) {
-        throw new Error(
-          "Invalid channel playback response"
-        );
-      }
-
-      const streamUrl =
-        data.url ||
-        data.stream_url ||
-        data.link;
-
-      if (!streamUrl) {
-        throw new Error(
-          "Missing stream URL"
-        );
-      }
-
-      validateHttpUrl(
-        streamUrl
-      );
-
-      const value = {
-        channelId:
-          String(channelId),
-
-        url:
-          streamUrl,
-
-        referer:
-          data.referer ||
-          data.headers?.Referer ||
-          data.headers?.referer ||
-          CONFIG.DEFAULT_REFERER,
-
-        userAgent:
-          data.user_agent ||
-          data.userAgent ||
-          data.headers?.["User-Agent"] ||
-          data.headers?.["user-agent"] ||
-          CONFIG.DEFAULT_PLAYER_UA,
-      };
-
-      L1_PLAYBACK.set(
-        channelId,
-        {
-          expires:
-            Date.now() + 15000,
-          value,
-        }
-      );
-
-      try {
-        await putJsonCache(
-          key,
-          value,
-          CONFIG.PLAYBACK_TTL
-        );
-      } catch {}
-
-      return value;
-    }
+  const raw = textEncoder.encode(
+    JSON.stringify(data)
   );
-}
 
-
-// ============================================================================
-// LOCK CACHE
-// ============================================================================
-
-async function getTimelineLock(
-  channelId
-) {
-  const key =
-    internalRequest(
-      `lock/${channelId}`
-    );
-
-  try {
-    const cached =
-      await caches.default.match(
-        key
-      );
-
-    if (!cached) {
-      return null;
-    }
-
-    return await cached.json();
-  } catch {
-    return null;
-  }
-}
-
-
-async function saveTimelineLock(
-  channelId,
-  state
-) {
-  const key =
-    internalRequest(
-      `lock/${channelId}`
-    );
-
-  try {
-    await putJsonCache(
-      key,
-      state,
-      CONFIG.LOCK_TTL
-    );
-  } catch {}
-}
-
-
-// ============================================================================
-// CATEGORIES
-// ============================================================================
-
-async function getCategories() {
-  const key =
-    internalRequest(
-      "categories"
-    );
-
-  try {
-    const cached =
-      await caches.default.match(
-        key
-      );
-
-    if (cached) {
-      return await cached.json();
-    }
-  } catch {}
-
-  const data =
-    normalize(
-      await apiFetch(
-        "categories"
-      )
-    );
-
-  if (
-    !Array.isArray(data)
-  ) {
-    throw new Error(
-      "Invalid categories response"
-    );
-  }
-
-  await putJsonCache(
+  const encrypted = await crypto.subtle.encrypt(
+    {
+      name: "AES-CBC",
+      iv,
+    },
     key,
-    data,
-    CONFIG.CATEGORY_TTL
+    raw
   );
 
-  return data;
+  const encryptedB64 = bytesToBase64(
+    new Uint8Array(encrypted)
+  );
+
+  const ivB64 = bytesToBase64(iv);
+
+  return `${encryptedB64}:${ivB64}`;
 }
 
+async function decryptPayload(payload) {
+  payload = String(payload || "").trim();
 
-async function getCategoryChannels(
-  categoryId
-) {
-  const key =
-    internalRequest(
-      `category/${categoryId}`
-    );
+  const pos = payload.lastIndexOf(":");
 
-  try {
-    const cached =
-      await caches.default.match(
-        key
-      );
-
-    if (cached) {
-      return await cached.json();
-    }
-  } catch {}
-
-  const data =
-    normalize(
-      await apiFetch(
-        `categories/${encodeURIComponent(
-          categoryId
-        )}/channels`
-      )
-    );
-
-  if (
-    !Array.isArray(data)
-  ) {
-    throw new Error(
-      "Invalid channels response"
-    );
+  if (pos === -1) {
+    throw new Error("Encrypted response missing IV");
   }
 
-  await putJsonCache(
+  const encryptedB64 = payload.slice(0, pos);
+  const ivB64 = payload.slice(pos + 1);
+
+  const encrypted = base64ToBytes(encryptedB64);
+  const iv = base64ToBytes(ivB64);
+
+  const key = await getAesKey();
+
+  const decrypted = await crypto.subtle.decrypt(
+    {
+      name: "AES-CBC",
+      iv,
+    },
     key,
-    data,
-    CONFIG.CATEGORY_TTL
+    encrypted
   );
 
-  return data;
+  const text = textDecoder.decode(decrypted);
+
+  return JSON.parse(text);
 }
 
 
-// ============================================================================
-// API FETCH
-// ============================================================================
+// ============================================================
+// TIMEOUT FETCH
+// ============================================================
 
-async function apiFetch(
-  endpoint
-) {
-  const url =
-    `${CONFIG.API_BASE}/` +
-    String(endpoint)
-      .replace(/^\/+/, "");
+async function fetchTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
 
-  const headers =
-    new Headers();
-
-  headers.set(
-    "User-Agent",
-    CONFIG.API_UA
-  );
-
-  headers.set(
-    "Accept",
-    "application/json"
-  );
-
-  headers.set(
-    "Cache-Control",
-    "no-cache"
-  );
-
-  const response =
-    await timedFetch(
-      url,
-      {
-        method: "GET",
-        headers,
-        redirect: "follow",
-      },
-      CONFIG.API_TIMEOUT_MS
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `API HTTP ${response.status}`
-    );
-  }
-
-  const t =
-    response.headers.get(
-      "t"
-    );
-
-  if (!t) {
-    throw new Error(
-      "Missing API t header"
-    );
-  }
-
-  const encrypted =
-    (
-      await response.text()
-    ).trim();
-
-  return decryptPayload(
-    encrypted,
-    t
-  );
-}
-
-
-// ============================================================================
-// DECRYPT
-// ============================================================================
-
-function decryptPayload(
-  encrypted,
-  t
-) {
-  let binary;
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
 
   try {
-    binary =
-      atob(encrypted);
-  } catch {
-    throw new Error(
-      "Invalid Base64 API response"
-    );
-  }
-
-  const input =
-    new Uint8Array(
-      binary.length
-    );
-
-  for (
-    let i = 0;
-    i <
-    binary.length;
-    i++
-  ) {
-    input[i] =
-      binary.charCodeAt(i);
-  }
-
-  const key =
-    new TextEncoder().encode(
-      CONFIG.STATIC_KEY +
-        String(t)
-    );
-
-  const output =
-    new Uint8Array(
-      input.length
-    );
-
-  for (
-    let i = 0;
-    i <
-    input.length;
-    i++
-  ) {
-    output[i] =
-      input[i] ^
-      key[
-        i %
-          key.length
-      ];
-  }
-
-  const text =
-    new TextDecoder(
-      "utf-8"
-    ).decode(output);
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(
-      "Invalid decrypted JSON"
-    );
-  }
-}
-
-
-// ============================================================================
-// NORMALIZE
-// ============================================================================
-
-function normalize(payload) {
-  if (
-    payload &&
-    typeof payload ===
-      "object" &&
-    Object.prototype
-      .hasOwnProperty.call(
-        payload,
-        "data"
-      )
-  ) {
-    return payload.data;
-  }
-
-  return payload;
-}
-
-
-// ============================================================================
-// MANIFEST REWRITE
-// ============================================================================
-
-async function rewriteManifest(
-  manifest,
-  sourceUrl,
-  workerOrigin,
-  channelId,
-  profile
-) {
-  const base =
-    new URL(sourceUrl);
-
-  const lines =
-    manifest.split(/\r?\n/);
-
-  const output = [];
-
-  for (
-    const original
-    of lines
-  ) {
-    const line =
-      original.trim();
-
-    if (!line) {
-      output.push(original);
-      continue;
-    }
-
-    if (
-      line.startsWith("#")
-    ) {
-      const rewritten =
-        original.replace(
-          /URI=(["'])(.*?)\1/gi,
-          (
-            full,
-            quote,
-            value
-          ) => {
-            try {
-              const absolute =
-                resolveChildUrl(
-                  value,
-                  base
-                );
-
-              const proxied =
-                buildResourceUrl(
-                  workerOrigin,
-                  channelId,
-                  profile,
-                  absolute
-                );
-
-              return (
-                `URI=${quote}` +
-                proxied +
-                quote
-              );
-            } catch {
-              return full;
-            }
-          }
-        );
-
-      output.push(rewritten);
-      continue;
-    }
-
-    try {
-      const absolute =
-        resolveChildUrl(
-          line,
-          base
-        );
-
-      output.push(
-        buildResourceUrl(
-          workerOrigin,
-          channelId,
-          profile,
-          absolute
-        )
-      );
-    } catch {
-      output.push(original);
-    }
-  }
-
-  return output.join("\n");
-}
-
-
-// ============================================================================
-// RESOURCE URL
-// ============================================================================
-
-function buildResourceUrl(
-  origin,
-  channelId,
-  profile,
-  upstreamUrl
-) {
-  const params =
-    new URLSearchParams();
-
-  params.set(
-    "cid",
-    channelId
-  );
-
-  params.set(
-    "p",
-    profile
-  );
-
-  params.set(
-    "u",
-    upstreamUrl
-  );
-
-  return (
-    `${origin}/_r?` +
-    params.toString()
-  );
-}
-
-
-// ============================================================================
-// CHILD URL
-// ============================================================================
-
-function resolveChildUrl(
-  value,
-  parent
-) {
-  const target =
-    new URL(
-      value,
-      parent
-    );
-
-  const authKeys = [
-    "t",
-    "e",
-    "token",
-    "auth",
-    "expires",
-    "signature",
-    "sig",
-  ];
-
-  for (
-    const key
-    of authKeys
-  ) {
-    if (
-      !target.searchParams.has(
-        key
-      ) &&
-      parent.searchParams.has(
-        key
-      )
-    ) {
-      target.searchParams.set(
-        key,
-        parent.searchParams.get(
-          key
-        )
-      );
-    }
-  }
-
-  return target.href;
-}
-
-
-// ============================================================================
-// EXTRACT RESOURCES
-// ============================================================================
-
-function extractResources(
-  manifest,
-  sourceUrl
-) {
-  const base =
-    new URL(sourceUrl);
-
-  const output = [];
-
-  for (
-    const raw
-    of manifest.split(/\r?\n/)
-  ) {
-    const line =
-      raw.trim();
-
-    if (!line) {
-      continue;
-    }
-
-    if (
-      !line.startsWith("#")
-    ) {
-      try {
-        output.push(
-          resolveChildUrl(
-            line,
-            base
-          )
-        );
-      } catch {}
-    }
-
-    const regex =
-      /URI=(["'])(.*?)\1/gi;
-
-    let match;
-
-    while (
-      (match =
-        regex.exec(raw)) !==
-      null
-    ) {
-      try {
-        output.push(
-          resolveChildUrl(
-            match[2],
-            base
-          )
-        );
-      } catch {}
-    }
-  }
-
-  return output;
-}
-
-
-// ============================================================================
-// CANONICAL IDENTITY
-// ============================================================================
-
-function canonicalMediaIdentity(
-  value
-) {
-  try {
-    const url =
-      new URL(value);
-
-    const params =
-      new URLSearchParams(
-        url.search
-      );
-
-    const volatile = [
-      "t",
-      "e",
-      "token",
-      "auth",
-      "expires",
-      "signature",
-      "sig",
-    ];
-
-    for (
-      const key
-      of volatile
-    ) {
-      params.delete(key);
-    }
-
-    const entries =
-      [...params.entries()].sort(
-        (a, b) =>
-          a[0].localeCompare(
-            b[0]
-          )
-      );
-
-    const stable =
-      new URLSearchParams(
-        entries
-      ).toString();
-
-    return (
-      url.pathname +
-      (
-        stable
-          ? `?${stable}`
-          : ""
-      )
-    );
-  } catch {
-    return String(value);
-  }
-}
-
-
-// ============================================================================
-// SEGMENT DETECTION
-// ============================================================================
-
-function isLikelyMediaSegment(
-  value
-) {
-  try {
-    const path =
-      new URL(value)
-        .pathname
-        .toLowerCase();
-
-    return (
-      path.endsWith(".ts") ||
-      path.endsWith(".mpegts") ||
-      path.endsWith(".pdf") ||
-      path.endsWith(".js") ||
-      path.endsWith(".m4s") ||
-      path.endsWith(".cmfv") ||
-      path.endsWith(".cmfa") ||
-      path.endsWith(".aac") ||
-      path.endsWith(".mp4")
-    );
-  } catch {
-    return false;
-  }
-}
-
-
-// ============================================================================
-// MEDIA TYPE LABEL
-// ============================================================================
-
-function segmentTypeLabel(
-  value
-) {
-  try {
-    const path =
-      new URL(value)
-        .pathname
-        .toLowerCase();
-
-    if (
-      path.endsWith(".pdf") ||
-      path.endsWith(".js") ||
-      path.endsWith(".ts") ||
-      path.endsWith(".mpegts")
-    ) {
-      return "mpegts";
-    }
-
-    if (
-      path.endsWith(".m4s") ||
-      path.endsWith(".cmfv") ||
-      path.endsWith(".mp4")
-    ) {
-      return "fmp4";
-    }
-
-    if (
-      path.endsWith(".cmfa")
-    ) {
-      return "audio-mp4";
-    }
-
-    if (
-      path.endsWith(".aac")
-    ) {
-      return "aac";
-    }
-  } catch {}
-
-  return "binary";
-}
-
-
-// ============================================================================
-// TIMELINE
-// ============================================================================
-
-function getMediaSequence(
-  manifest
-) {
-  const match =
-    manifest.match(
-      /#EXT-X-MEDIA-SEQUENCE:(\d+)/i
-    );
-
-  return match
-    ? Number(match[1])
-    : 0;
-}
-
-
-function getTargetDuration(
-  manifest
-) {
-  const match =
-    manifest.match(
-      /#EXT-X-TARGETDURATION:(\d+)/i
-    );
-
-  return match
-    ? Number(match[1])
-    : 0;
-}
-
-
-function detectResourceFamily(
-  manifest,
-  sourceUrl
-) {
-  const base =
-    new URL(sourceUrl);
-
-  for (
-    const raw
-    of manifest.split(/\r?\n/)
-  ) {
-    const line =
-      raw.trim();
-
-    if (
-      !line ||
-      line.startsWith("#")
-    ) {
-      continue;
-    }
-
-    try {
-      const pathname =
-        new URL(
-          line,
-          base
-        )
-          .pathname
-          .toLowerCase();
-
-      const match =
-        pathname.match(
-          /\.([a-z0-9]+)$/
-        );
-
-      if (match) {
-        return match[1];
-      }
-    } catch {}
-  }
-
-  return "unknown";
-}
-
-
-// ============================================================================
-// TOKEN
-// ============================================================================
-
-function tokenNearExpiry(
-  value
-) {
-  try {
-    const url =
-      new URL(value);
-
-    const expiry =
-      Number(
-        url.searchParams.get(
-          "e"
-        )
-      );
-
-    if (
-      !Number.isFinite(
-        expiry
-      ) ||
-      expiry <= 0
-    ) {
-      return false;
-    }
-
-    const now =
-      Math.floor(
-        Date.now() / 1000
-      );
-
-    return (
-      expiry - now <=
-      CONFIG.TOKEN_REFRESH_MARGIN
-    );
-  } catch {
-    return false;
-  }
-}
-
-
-// ============================================================================
-// ORIGIN HEADERS
-// ============================================================================
-
-function originHeaders(
-  playback,
-  includeRange,
-  request = null
-) {
-  const headers =
-    new Headers();
-
-  headers.set(
-    "Accept",
-    "*/*"
-  );
-
-  if (playback?.referer) {
-    headers.set(
-      "Referer",
-      playback.referer
-    );
-  }
-
-  if (playback?.userAgent) {
-    headers.set(
-      "User-Agent",
-      playback.userAgent
-    );
-  }
-
-  if (
-    includeRange &&
-    request
-  ) {
-    const range =
-      request.headers.get(
-        "Range"
-      );
-
-    if (range) {
-      headers.set(
-        "Range",
-        range
-      );
-    }
-  }
-
-  return headers;
-}
-
-
-// ============================================================================
-// FETCH TIMEOUT
-// ============================================================================
-
-async function timedFetch(
-  url,
-  options,
-  timeoutMs
-) {
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      timeoutMs
-    );
-
-  try {
-    return await fetch(
-      url,
-      {
-        ...options,
-        signal:
-          controller.signal,
-      }
-    );
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timer);
   }
 }
 
 
-// ============================================================================
-// DEDUPE
-// ============================================================================
+// ============================================================
+// API PAYLOAD
+// ============================================================
 
-async function dedupe(
-  key,
-  producer
-) {
-  if (
-    INFLIGHT.has(key)
-  ) {
-    return await INFLIGHT.get(
-      key
-    );
-  }
+function commonPayload() {
+  return {
+    user_id: makeUserId(),
 
-  const promise =
-    (async () =>
-      await producer())();
+    device_id: DEVICE_ID,
 
-  INFLIGHT.set(
-    key,
-    promise
-  );
+    device_api: CONFIG.DEVICE_API,
 
-  try {
-    return await promise;
-  } finally {
-    INFLIGHT.delete(key);
-  }
+    version_name: CONFIG.APP_VERSION,
+
+    language: CONFIG.LANGUAGE,
+
+    timezone: CONFIG.TIMEZONE,
+
+    device_type: CONFIG.DEVICE_TYPE,
+
+    KEY_ACTIVATED_TYPE:
+      CONFIG.KEY_ACTIVATED_TYPE,
+
+    store: CONFIG.STORE,
+
+    isStoreVersion: false,
+
+    isPremium: false,
+
+    isCoupon_active: false,
+
+    hideAds: false,
+
+    appCount: JSON.stringify({
+      adsFailed: 0,
+      adsLoaded: 0,
+      adsShowed: 0,
+      runCount: 1,
+    }),
+
+    mainServer:
+      "http://main.backendcoreapi.com/api/live/livedrama/v13.0.0/",
+  };
 }
 
 
-// ============================================================================
-// CACHE KEYS
-// ============================================================================
+// ============================================================
+// ENCRYPTED POST
+// ============================================================
 
-function internalRequest(path) {
-  return new Request(
-    `https://ycn-cache.internal/${path}`,
-    {
-      method: "GET",
+async function encryptedPost(url, data) {
+  const body = await encryptPayload(data);
+
+  let lastError;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetchTimeout(
+        url,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json; charset=utf-8",
+
+            "User-Agent":
+              "Dalvik/2.1.0 (Linux; U; Android 16)",
+
+            Accept: "*/*",
+
+            "Accept-Encoding": "gzip",
+          },
+
+          body,
+          redirect: "follow",
+        },
+        CONFIG.API_TIMEOUT
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `API HTTP ${response.status}`
+        );
+      }
+
+      const text = await response.text();
+
+      return await decryptPayload(text);
+
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === 0) {
+        await sleep(200);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+
+// ============================================================
+// API
+// ============================================================
+
+async function getTopics(force = false) {
+  const key = "topics";
+
+  if (!force) {
+    const cached = cacheGet(
+      apiCache,
+      key,
+      CONFIG.API_CACHE_MS
+    );
+
+    if (cached) return cached;
+  }
+
+  const payload = commonPayload();
+
+  payload.type = "tv";
+
+  const obj = await encryptedPost(
+    `${CONFIG.LIVE_API_BASE}/getliveTopics`,
+    payload
+  );
+
+  const items = obj.live_topics || [];
+
+  cacheSet(apiCache, key, items);
+
+  return items;
+}
+
+async function getChannels(topic, force = false) {
+  const key = `channels:${topic}`;
+
+  if (!force) {
+    const cached = cacheGet(
+      apiCache,
+      key,
+      CONFIG.API_CACHE_MS
+    );
+
+    if (cached) return cached;
+  }
+
+  const payload = commonPayload();
+
+  payload.type = "tv";
+  payload.topic = topic;
+
+  const obj = await encryptedPost(
+    `${CONFIG.LIVE_API_BASE}/getLiveByTopic`,
+    payload
+  );
+
+  const items = obj.live || [];
+
+  cacheSet(apiCache, key, items);
+
+  return items;
+}
+
+async function getStreamInfo(channelId) {
+  const payload = commonPayload();
+
+  payload.id = String(channelId);
+
+  const obj = await encryptedPost(
+    `${CONFIG.LIVE_API_BASE}/getLiveAllStreamsById`,
+    payload
+  );
+
+  if (!obj.live) {
+    throw new Error(
+      "لم يرجع الخادم معلومات بث للقناة"
+    );
+  }
+
+  return obj.live;
+}
+
+
+// ============================================================
+// SERVER PARSING
+// ============================================================
+
+function prettyLabel(value, fallback) {
+  const text = String(value || "");
+  const upper = text.toUpperCase();
+
+  if (upper.includes("DADDY")) {
+    const m = upper.match(
+      /DADDY[_\- ]*([A-Z0-9]+)/
+    );
+
+    return m
+      ? `Daddy ${m[1]}`
+      : "Daddy";
+  }
+
+  if (
+    upper.includes("LOAD_BALANCER") ||
+    upper.includes("LOADBALANCER")
+  ) {
+    return "Load Balancer";
+  }
+
+  if (
+    upper.includes("DESCRIPTION_M+") ||
+    upper.includes("DESCRIPTION_MPLUS") ||
+    upper.includes("_M+_")
+  ) {
+    return "M+";
+  }
+
+  if (
+    upper.includes("DESCRIPTION_DL") ||
+    upper.includes("_DL_")
+  ) {
+    return "DL";
+  }
+
+  if (
+    upper.includes("DESCRIPTION_SD") ||
+    upper.includes("_SD_")
+  ) {
+    return "SD";
+  }
+
+  const m = text.match(
+    /description_([^/]+?)(?:_DL_|\/|$)/i
+  );
+
+  if (m) {
+    const label = m[1]
+      .replace(/_/g, " ")
+      .replace(/-/g, " ")
+      .trim();
+
+    if (label) return label.slice(0, 50);
+  }
+
+  return fallback;
+}
+
+function parseBackupPiece(raw, index) {
+  let part = String(raw || "").trim();
+
+  if (!part) return null;
+
+  let source = part;
+  let resolverAgent = "redirect";
+
+  if (part.includes(" -- ")) {
+    const splitIndex = part.lastIndexOf(" -- ");
+
+    source = part.slice(0, splitIndex).trim();
+
+    resolverAgent =
+      part.slice(splitIndex + 4).trim() ||
+      "redirect";
+  }
+
+  const meta = safeJSON(source) || {};
+
+  const directUrl = String(
+    meta.url || source
+  ).trim();
+
+  const description = String(
+    meta.description || ""
+  ).trim();
+
+  return {
+    request_url: source,
+
+    direct_url: directUrl,
+
+    agent: resolverAgent,
+
+    label:
+      description ||
+      prettyLabel(
+        directUrl,
+        `سيرفر ${index}`
+      ),
+
+    description:
+      description ||
+      prettyLabel(
+        directUrl,
+        `سيرفر ${index}`
+      ),
+
+    headers:
+      meta.headers &&
+      typeof meta.headers === "object"
+        ? meta.headers
+        : {},
+
+    acceptSSL: meta.acceptSSL,
+
+    mediatype: meta.mediatype,
+
+    swap:
+      meta.swap &&
+      typeof meta.swap === "object"
+        ? meta.swap
+        : {},
+  };
+}
+
+function parseStreamOptions(live) {
+  const options = [];
+
+  const mainUrl = String(
+    live.url || ""
+  ).trim();
+
+  if (mainUrl) {
+    options.push({
+      request_url: mainUrl,
+
+      direct_url: mainUrl,
+
+      agent:
+        String(live.agent || "redirect"),
+
+      label: prettyLabel(
+        mainUrl,
+        "الرئيسي"
+      ),
+
+      description: "السيرفر الرئيسي",
+
+      headers:
+        live.headers &&
+        typeof live.headers === "object"
+          ? live.headers
+          : {},
+
+      acceptSSL: live.acceptSSL,
+
+      mediatype: live.mediatype,
+
+      swap:
+        live.swap &&
+        typeof live.swap === "object"
+          ? live.swap
+          : {},
+    });
+  }
+
+  let parts = [];
+
+  if (Array.isArray(live.backup)) {
+    parts = live.backup;
+  } else if (typeof live.backup === "string") {
+    parts = live.backup.split("-;-");
+  }
+
+  for (let i = 0; i < parts.length; i++) {
+    const item = parseBackupPiece(
+      parts[i],
+      i + 2
+    );
+
+    if (item) options.push(item);
+  }
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const option of options) {
+    const signature =
+      `${option.request_url}|${option.agent}`;
+
+    if (seen.has(signature)) continue;
+
+    seen.add(signature);
+    unique.push(option);
+  }
+
+  return unique;
+}
+
+async function getStreamOptions(channelId) {
+  const live =
+    await getStreamInfo(channelId);
+
+  const options =
+    parseStreamOptions(live);
+
+  if (!options.length) {
+    throw new Error(
+      "لا توجد سيرفرات لهذه القناة"
+    );
+  }
+
+  return {
+    live,
+    options,
+  };
+}
+
+
+// ============================================================
+// REDIRECT RESOLVER
+// ============================================================
+
+function unwrapResolverData(obj) {
+  const data =
+    obj && typeof obj.data === "object"
+      ? obj.data
+      : {};
+
+  const outerAgent = data.agent;
+
+  let nested = data.url;
+
+  if (typeof nested === "string") {
+    const parsed = safeJSON(nested);
+
+    nested = parsed || {
+      url: nested,
+    };
+  }
+
+  if (
+    !nested ||
+    typeof nested !== "object"
+  ) {
+    nested = {};
+  }
+
+  return {
+    outer_agent: outerAgent,
+
+    url: nested.url,
+
+    agent: nested.agent,
+
+    acceptSSL: nested.acceptSSL,
+
+    headers:
+      nested.headers &&
+      typeof nested.headers === "object"
+        ? nested.headers
+        : {},
+
+    mediatype: nested.mediatype,
+
+    swap:
+      nested.swap &&
+      typeof nested.swap === "object"
+        ? nested.swap
+        : {},
+
+    raw: obj,
+  };
+}
+
+async function resolveRedirect(
+  channelId,
+  streamUrl,
+  agent
+) {
+  const payload = commonPayload();
+
+  payload.id = String(channelId);
+  payload.url = streamUrl;
+  payload.agent = agent;
+
+  const obj = await encryptedPost(
+    `${CONFIG.REDIRECT_API_BASE}/getLiveByRedirect`,
+    payload
+  );
+
+  return unwrapResolverData(obj);
+}
+
+
+// ============================================================
+// CHANNEL RESOLUTION
+// ============================================================
+
+async function resolveChannel(
+  channelId,
+  serverIndex = 0,
+  force = false
+) {
+  channelId = String(channelId);
+
+  serverIndex =
+    Number.parseInt(serverIndex, 10) || 0;
+
+  const cacheKey =
+    `${channelId}:${serverIndex}`;
+
+  if (!force) {
+    const cached = cacheGet(
+      resolveCache,
+      cacheKey,
+      CONFIG.RESOLVE_CACHE_MS
+    );
+
+    if (cached) {
+      return cached;
+    }
+  }
+
+  const {
+    live,
+    options,
+  } = await getStreamOptions(channelId);
+
+  if (
+    serverIndex < 0 ||
+    serverIndex >= options.length
+  ) {
+    throw new Error(
+      "رقم السيرفر غير صالح"
+    );
+  }
+
+  const selected =
+    options[serverIndex];
+
+  const source =
+    selected.request_url || "";
+
+  let resolverAgent =
+    selected.agent || "redirect";
+
+  let resolved;
+
+  const resolverModes = new Set([
+    "redirect",
+    "double_redirect",
+    "all_streams_redirect",
+  ]);
+
+  if (resolverModes.has(resolverAgent)) {
+    resolved =
+      await resolveRedirect(
+        channelId,
+        source,
+        resolverAgent
+      );
+
+    // --------------------------------------------------------
+    // Recursive redirect handling
+    // --------------------------------------------------------
+
+    for (
+      let depth = 0;
+      depth < CONFIG.MAX_REDIRECT_DEPTH;
+      depth++
+    ) {
+      const nextUrl = String(
+        resolved.url || ""
+      );
+
+      const nextAgent = String(
+        resolved.agent ||
+        resolved.outer_agent ||
+        ""
+      );
+
+      const looksLikeResolver =
+        nextUrl.includes(".LS.") ||
+        nextUrl.includes("custom_handler") ||
+        resolverModes.has(nextAgent);
+
+      if (!looksLikeResolver) {
+        break;
+      }
+
+      try {
+        const second =
+          await resolveRedirect(
+            channelId,
+            nextUrl,
+            nextAgent || "redirect"
+          );
+
+        if (!second.url) break;
+
+        second.headers = {
+          ...(resolved.headers || {}),
+          ...(second.headers || {}),
+        };
+
+        second.swap = {
+          ...(resolved.swap || {}),
+          ...(second.swap || {}),
+        };
+
+        resolved = second;
+
+      } catch {
+        break;
+      }
+    }
+
+  } else {
+    const meta =
+      safeJSON(source) || {};
+
+    resolved = {
+      url:
+        meta.url ||
+        selected.direct_url ||
+        source,
+
+      agent:
+        meta.agent || "",
+
+      headers:
+        meta.headers ||
+        selected.headers ||
+        {},
+
+      acceptSSL:
+        meta.acceptSSL ??
+        selected.acceptSSL,
+
+      mediatype:
+        meta.mediatype ||
+        selected.mediatype,
+
+      swap:
+        meta.swap ||
+        selected.swap ||
+        {},
+    };
+  }
+
+  if (!resolved.url) {
+    throw new Error(
+      "تعذر استخراج رابط البث النهائي"
+    );
+  }
+
+  const headers = {
+    ...(selected.headers || {}),
+    ...(resolved.headers || {}),
+  };
+
+  const swap = {
+    ...(selected.swap || {}),
+    ...(resolved.swap || {}),
+  };
+
+  const result = {
+    channel_id: channelId,
+
+    name:
+      live.name ||
+      channelId,
+
+    image:
+      live.img_url || "",
+
+    server_index:
+      serverIndex,
+
+    server_label:
+      selected.label ||
+      `سيرفر ${serverIndex + 1}`,
+
+    server_type:
+      resolverAgent,
+
+    resolved_url:
+      String(resolved.url),
+
+    headers,
+
+    agent:
+      resolved.agent || "",
+
+    acceptSSL:
+      resolved.acceptSSL ??
+      selected.acceptSSL,
+
+    mediatype:
+      String(
+        resolved.mediatype ||
+        selected.mediatype ||
+        ""
+      ).toLowerCase(),
+
+    swap,
+  };
+
+  cacheSet(
+    resolveCache,
+    cacheKey,
+    result
+  );
+
+  return result;
+}
+
+
+// ============================================================
+// UPSTREAM HEADERS
+// ============================================================
+
+function buildUpstreamHeaders(
+  info,
+  url,
+  incomingRequest = null
+) {
+  const headers = new Headers();
+
+  const sourceHeaders =
+    info.headers || {};
+
+  for (
+    const [key, value]
+    of Object.entries(sourceHeaders)
+  ) {
+    if (
+      value !== undefined &&
+      value !== null
+    ) {
+      try {
+        headers.set(
+          key,
+          String(value)
+        );
+      } catch {
+        // Ignore invalid upstream header.
+      }
+    }
+  }
+
+  if (
+    info.agent &&
+    !headers.has("User-Agent")
+  ) {
+    headers.set(
+      "User-Agent",
+      String(info.agent)
+    );
+  }
+
+  if (!headers.has("User-Agent")) {
+    headers.set(
+      "User-Agent",
+      CONFIG.DEFAULT_UA
+    );
+  }
+
+  if (!headers.has("Accept")) {
+    headers.set(
+      "Accept",
+      "*/*"
+    );
+  }
+
+  // Prevent origin compression from complicating raw streaming.
+  headers.set(
+    "Accept-Encoding",
+    "identity"
+  );
+
+  if (
+    !headers.has("Referer") &&
+    isHttpUrl(url)
+  ) {
+    try {
+      const u = new URL(url);
+
+      headers.set(
+        "Referer",
+        `${u.protocol}//${u.host}/`
+      );
+    } catch {
+      // Ignore.
+    }
+  }
+
+  if (
+    incomingRequest &&
+    incomingRequest.headers.has("Range")
+  ) {
+    headers.set(
+      "Range",
+      incomingRequest.headers.get("Range")
+    );
+  }
+
+  return headers;
+}
+
+
+// ============================================================
+// SWAP
+// ============================================================
+
+function applySwap(value, swaps) {
+  let output =
+    String(value || "");
+
+  if (
+    !swaps ||
+    typeof swaps !== "object"
+  ) {
+    return output;
+  }
+
+  for (
+    const [oldValue, newValue]
+    of Object.entries(swaps)
+  ) {
+    if (!oldValue) continue;
+
+    output =
+      output.split(oldValue).join(
+        String(newValue || "")
+      );
+  }
+
+  return output;
+}
+
+
+// ============================================================
+// RESOURCE URL
+// ============================================================
+
+function makeResourcePath(
+  workerOrigin,
+  channelId,
+  serverIndex,
+  absoluteUrl
+) {
+  const token =
+    encodeBase64Url(absoluteUrl);
+
+  return (
+    `${workerOrigin}/r/` +
+    `${encodeURIComponent(channelId)}/` +
+    `${serverIndex}/` +
+    token
+  );
+}
+
+
+// ============================================================
+// HLS REWRITER
+// ============================================================
+
+function makeAbsoluteUrl(baseUrl, value) {
+  try {
+    return new URL(
+      value,
+      baseUrl
+    ).toString();
+  } catch {
+    return value;
+  }
+}
+
+function rewriteUriAttributes(
+  line,
+  manifestUrl,
+  workerOrigin,
+  channelId,
+  serverIndex,
+  swap
+) {
+  return line.replace(
+    /URI=(["'])(.*?)\1/gi,
+
+    (
+      full,
+      quote,
+      value
+    ) => {
+      const swapped =
+        applySwap(
+          value,
+          swap
+        );
+
+      const absolute =
+        makeAbsoluteUrl(
+          manifestUrl,
+          swapped
+        );
+
+      const proxy =
+        makeResourcePath(
+          workerOrigin,
+          channelId,
+          serverIndex,
+          absolute
+        );
+
+      return `URI="${proxy}"`;
     }
   );
 }
 
-
-// ============================================================================
-// JSON CACHE
-// ============================================================================
-
-async function putJsonCache(
-  key,
-  value,
-  ttl
+function rewriteHls(
+  playlist,
+  manifestUrl,
+  workerOrigin,
+  channelId,
+  serverIndex,
+  swap
 ) {
-  const response =
-    new Response(
-      JSON.stringify(value),
-      {
-        status: 200,
-        headers: {
-          "Content-Type":
-            "application/json",
+  const lines =
+    String(playlist)
+      .replace(/\r/g, "")
+      .split("\n");
 
-          "Cache-Control":
-            `public, max-age=${ttl}`,
-        },
-      }
+  const output = [];
+
+  for (const original of lines) {
+    const trimmed =
+      original.trim();
+
+    if (!trimmed) {
+      output.push("");
+      continue;
+    }
+
+    if (
+      trimmed.startsWith("#")
+    ) {
+      output.push(
+        rewriteUriAttributes(
+          original,
+          manifestUrl,
+          workerOrigin,
+          channelId,
+          serverIndex,
+          swap
+        )
+      );
+
+      continue;
+    }
+
+    const swapped =
+      applySwap(
+        trimmed,
+        swap
+      );
+
+    const absolute =
+      makeAbsoluteUrl(
+        manifestUrl,
+        swapped
+      );
+
+    output.push(
+      makeResourcePath(
+        workerOrigin,
+        channelId,
+        serverIndex,
+        absolute
+      )
     );
+  }
 
-  await caches.default.put(
-    key,
-    response
+  return output.join("\n");
+}
+
+
+// ============================================================
+// HLS DETECTION
+// ============================================================
+
+function looksLikeHls(
+  text,
+  contentType = "",
+  url = ""
+) {
+  const sample =
+    String(text || "")
+      .trimStart()
+      .slice(0, 1000);
+
+  const ct =
+    String(contentType || "")
+      .toLowerCase();
+
+  const path =
+    String(url || "")
+      .toLowerCase();
+
+  return (
+    sample.startsWith("#EXTM3U") ||
+    ct.includes("mpegurl") ||
+    path.includes(".m3u8")
   );
 }
 
 
-// ============================================================================
-// PLAYLIST HEADERS
-// ============================================================================
+// ============================================================
+// MEDIA FETCH
+// ============================================================
 
-function playlistHeaders() {
-  return new Headers({
-    "Content-Type":
-      "application/vnd.apple.mpegurl; charset=utf-8",
+async function fetchManifest(
+  info,
+  url
+) {
+  const headers =
+    buildUpstreamHeaders(
+      info,
+      url
+    );
 
-    "Cache-Control":
-      "no-store, no-cache, must-revalidate, max-age=0",
+  const response =
+    await fetchTimeout(
+      url,
+      {
+        method: "GET",
 
-    Pragma: "no-cache",
+        headers,
 
-    Expires: "0",
+        redirect: "follow",
 
-    "X-Content-Type-Options":
-      "nosniff",
+        // Live playlist must never become stale.
+        cf: {
+          cacheTtl: 0,
+          cacheEverything: false,
+        },
+      },
+
+      CONFIG.MANIFEST_TIMEOUT
+    );
+
+  return response;
+}
+
+
+// ============================================================
+// FIND HTML EMBEDDED M3U8
+// ============================================================
+
+function findMediaUrlInHtml(
+  html,
+  baseUrl
+) {
+  const patterns = [
+    /(?:file|src|source|url)\s*[:=]\s*["']([^"']+)["']/gi,
+
+    /["'](https?:\/\/[^"']+\.(?:m3u8|mpd)(?:\?[^"']*)?)["']/gi,
+  ];
+
+  for (const regex of patterns) {
+    let match;
+
+    while (
+      (match = regex.exec(html))
+    ) {
+      let found =
+        String(match[1] || "")
+          .replace(/\\\//g, "/");
+
+      if (
+        !found.toLowerCase()
+          .includes(".m3u8")
+      ) {
+        continue;
+      }
+
+      try {
+        return new URL(
+          found,
+          baseUrl
+        ).toString();
+      } catch {
+        return found;
+      }
+    }
+  }
+
+  return null;
+}
+
+
+// ============================================================
+// RESOLVE + GET PLAYLIST
+// ============================================================
+
+async function getResolvedPlaylist(
+  channelId,
+  serverIndex,
+  force = false
+) {
+  let info =
+    await resolveChannel(
+      channelId,
+      serverIndex,
+      force
+    );
+
+  let response =
+    await fetchManifest(
+      info,
+      info.resolved_url
+    );
+
+  // --------------------------------------------------------
+  // Expired token or transient resolver problem:
+  // force one full resolve and retry.
+  // --------------------------------------------------------
+
+  if (
+    response.status === 401 ||
+    response.status === 403 ||
+    response.status === 404 ||
+    response.status === 410 ||
+    response.status >= 500
+  ) {
+    info =
+      await resolveChannel(
+        channelId,
+        serverIndex,
+        true
+      );
+
+    response =
+      await fetchManifest(
+        info,
+        info.resolved_url
+      );
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Upstream HTTP ${response.status}`
+    );
+  }
+
+  let text =
+    await response.text();
+
+  let finalUrl =
+    response.url;
+
+  let contentType =
+    response.headers.get(
+      "Content-Type"
+    ) || "";
+
+  // HTML resolver/player page.
+  if (
+    contentType
+      .toLowerCase()
+      .includes("text/html") ||
+    /<html|<!doctype/i.test(
+      text.slice(0, 3000)
+    )
+  ) {
+    const embedded =
+      findMediaUrlInHtml(
+        text,
+        finalUrl
+      );
+
+    if (embedded) {
+      const second =
+        await fetchManifest(
+          info,
+          embedded
+        );
+
+      if (second.ok) {
+        text =
+          await second.text();
+
+        finalUrl =
+          second.url;
+
+        contentType =
+          second.headers.get(
+            "Content-Type"
+          ) || "";
+      }
+    }
+  }
+
+  if (
+    !looksLikeHls(
+      text,
+      contentType,
+      finalUrl
+    )
+  ) {
+    throw new Error(
+      "السيرفر لم يرجع HLS صالح"
+    );
+  }
+
+  return {
+    info,
+    response,
+    text,
+    finalUrl,
+  };
+}
+
+
+// ============================================================
+// API: TOPICS
+// ============================================================
+
+async function routeTopics(url) {
+  const force =
+    url.searchParams.get("force") === "1";
+
+  const items =
+    await getTopics(force);
+
+  return jsonResponse({
+    ok: true,
+
+    count: items.length,
+
+    items,
   });
 }
 
 
-// ============================================================================
-// CONTENT TYPE
-// ============================================================================
+// ============================================================
+// API: CHANNELS
+// ============================================================
 
-function detectContentType(
-  value,
-  upstreamType
-) {
-  let path = "";
+async function routeChannels(topic, url) {
+  const force =
+    url.searchParams.get("force") === "1";
 
-  try {
-    path =
-      new URL(value)
-        .pathname
-        .toLowerCase();
-  } catch {}
-
-  if (
-    path.endsWith(".m3u8")
-  ) {
-    return "application/vnd.apple.mpegurl";
-  }
-
-  if (
-    path.endsWith(".ts") ||
-    path.endsWith(".mpegts") ||
-    path.endsWith(".pdf") ||
-    path.endsWith(".js")
-  ) {
-    return "video/mp2t";
-  }
-
-  if (
-    path.endsWith(".m4s") ||
-    path.endsWith(".cmfv") ||
-    path.endsWith(".mp4")
-  ) {
-    return "video/mp4";
-  }
-
-  if (
-    path.endsWith(".cmfa")
-  ) {
-    return "audio/mp4";
-  }
-
-  if (
-    path.endsWith(".aac")
-  ) {
-    return "audio/aac";
-  }
-
-  if (
-    upstreamType &&
-    !String(upstreamType)
-      .toLowerCase()
-      .includes("text/html")
-  ) {
-    return upstreamType;
-  }
-
-  return "application/octet-stream";
-}
-
-
-// ============================================================================
-// MANIFEST TYPE
-// ============================================================================
-
-function isManifestType(
-  value,
-  contentType
-) {
-  const type =
-    String(
-      contentType || ""
-    ).toLowerCase();
-
-  if (
-    type.includes("mpegurl") ||
-    type.includes("m3u")
-  ) {
-    return true;
-  }
-
-  try {
-    return new URL(value)
-      .pathname
-      .toLowerCase()
-      .endsWith(".m3u8");
-  } catch {
-    return false;
-  }
-}
-
-
-// ============================================================================
-// URL VALIDATION
-// ============================================================================
-
-function validateHttpUrl(value) {
-  const url = new URL(value);
-
-  if (
-    url.protocol !== "http:" &&
-    url.protocol !== "https:"
-  ) {
-    throw new Error(
-      "Unsupported upstream protocol"
+  const items =
+    await getChannels(
+      topic,
+      force
     );
-  }
 
-  return url;
+  return jsonResponse({
+    ok: true,
+
+    topic,
+
+    count: items.length,
+
+    items,
+  });
 }
 
 
-// ============================================================================
-// HOST
-// ============================================================================
+// ============================================================
+// API: SERVERS
+// ============================================================
 
-function safeHost(value) {
-  try {
-    return new URL(value)
-      .hostname;
-  } catch {
-    return "";
-  }
+async function routeServers(channelId) {
+  const {
+    live,
+    options,
+  } =
+    await getStreamOptions(
+      channelId
+    );
+
+  const servers =
+    options.map(
+      (server, index) => ({
+        index,
+
+        label:
+          server.label ||
+          `سيرفر ${index + 1}`,
+
+        description:
+          server.description || "",
+
+        type:
+          server.agent ||
+          "redirect",
+
+        media_type:
+          String(
+            server.mediatype || ""
+          ).toLowerCase(),
+
+        hls:
+          `/live/${encodeURIComponent(channelId)}.m3u8?server=${index}`,
+
+        watch:
+          `/watch/${encodeURIComponent(channelId)}?server=${index}`,
+      })
+    );
+
+  return jsonResponse({
+    ok: true,
+
+    channel_id:
+      channelId,
+
+    name:
+      live.name ||
+      channelId,
+
+    image:
+      live.img_url || "",
+
+    count:
+      servers.length,
+
+    servers,
+  });
 }
 
 
-// ============================================================================
-// JSON
-// ============================================================================
+// ============================================================
+// API: RESOLVE DEBUG
+// ============================================================
 
-function json(
-  value,
-  status = 200
+async function routeResolve(
+  channelId,
+  url
 ) {
+  const server =
+    Number.parseInt(
+      url.searchParams.get("server") || "0",
+      10
+    ) || 0;
+
+  const force =
+    url.searchParams.get("force") === "1";
+
+  const info =
+    await resolveChannel(
+      channelId,
+      server,
+      force
+    );
+
+  // Do not expose final upstream URL.
+  return jsonResponse({
+    ok: true,
+
+    channel_id:
+      channelId,
+
+    server_index:
+      server,
+
+    server_label:
+      info.server_label,
+
+    server_type:
+      info.server_type,
+
+    media_type:
+      info.mediatype,
+
+    ready: true,
+
+    play_url:
+      `/live/${encodeURIComponent(channelId)}.m3u8?server=${server}`,
+  });
+}
+
+
+// ============================================================
+// LIVE PLAYLIST
+// ============================================================
+
+async function routeLive(
+  request,
+  url,
+  channelId
+) {
+  const workerOrigin =
+    url.origin;
+
+  let serverIndex =
+    Number.parseInt(
+      url.searchParams.get("server") || "0",
+      10
+    );
+
+  if (
+    Number.isNaN(serverIndex) ||
+    serverIndex < 0
+  ) {
+    serverIndex = 0;
+  }
+
+  const force =
+    url.searchParams.get("force") === "1";
+
+  let playlist;
+
+  try {
+    playlist =
+      await getResolvedPlaylist(
+        channelId,
+        serverIndex,
+        force
+      );
+
+  } catch (firstError) {
+    // --------------------------------------------------------
+    // Manifest-level failover.
+    // We only switch servers when selected source is actually
+    // unavailable. We do NOT randomly alternate live families.
+    // --------------------------------------------------------
+
+    const {
+      options,
+    } =
+      await getStreamOptions(
+        channelId
+      );
+
+    let lastError =
+      firstError;
+
+    let success =
+      null;
+
+    for (
+      let i = 0;
+      i < options.length;
+      i++
+    ) {
+      if (i === serverIndex) {
+        continue;
+      }
+
+      try {
+        success =
+          await getResolvedPlaylist(
+            channelId,
+            i,
+            true
+          );
+
+        serverIndex = i;
+        break;
+
+      } catch (error) {
+        lastError =
+          error;
+      }
+    }
+
+    if (!success) {
+      throw lastError;
+    }
+
+    playlist =
+      success;
+  }
+
+  const rewritten =
+    rewriteHls(
+      playlist.text,
+      playlist.finalUrl,
+      workerOrigin,
+      channelId,
+      serverIndex,
+      playlist.info.swap || {}
+    );
+
   return new Response(
-    JSON.stringify(
-      value,
-      null,
-      2
-    ),
+    rewritten,
     {
-      status,
+      status: 200,
+
       headers: {
         "Content-Type":
-          "application/json; charset=utf-8",
+          "application/vnd.apple.mpegurl; charset=utf-8",
 
+        "Access-Control-Allow-Origin":
+          "*",
+
+        "Access-Control-Allow-Headers":
+          "*",
+
+        "Access-Control-Expose-Headers":
+          "X-Drama-Server",
+
+        // Absolutely no browser/edge stale playlist.
         "Cache-Control":
-          "no-store",
+          "no-store, no-cache, must-revalidate, max-age=0",
+
+        Pragma:
+          "no-cache",
+
+        Expires:
+          "0",
+
+        "X-Drama-Server":
+          String(serverIndex),
       },
     }
   );
 }
 
 
-function errorJson(
-  message,
-  status = 500
+// ============================================================
+// RESOURCE PROXY
+// ============================================================
+
+async function routeResource(
+  request,
+  channelId,
+  serverIndex,
+  token
 ) {
-  return json(
-    {
-      ok: false,
-      error: message,
-      version: "6.1",
-    },
-    status
-  );
-}
+  let targetUrl;
 
+  try {
+    targetUrl =
+      decodeBase64Url(token);
+  } catch {
+    throw new Error(
+      "Invalid resource token"
+    );
+  }
 
-// ============================================================================
-// CORS
-// ============================================================================
+  if (!isHttpUrl(targetUrl)) {
+    throw new Error(
+      "Invalid upstream URL"
+    );
+  }
 
-function cors(response) {
-  const headers =
-    new Headers(
-      response.headers
+  let info =
+    await resolveChannel(
+      channelId,
+      serverIndex,
+      false
     );
 
-  headers.set(
+  const headers =
+    buildUpstreamHeaders(
+      info,
+      targetUrl,
+      request
+    );
+
+  let upstream =
+    await fetchTimeout(
+      targetUrl,
+      {
+        method:
+          request.method === "HEAD"
+            ? "HEAD"
+            : "GET",
+
+        headers,
+
+        redirect: "follow",
+
+        // Segments are allowed tiny edge caching.
+        // The playlist itself never uses this route unless nested.
+        cf: {
+          cacheTtl: 2,
+          cacheEverything: true,
+
+          cacheTtlByStatus: {
+            "200-299": 2,
+            "404": 0,
+            "500-599": 0,
+          },
+        },
+      },
+
+      CONFIG.RESOURCE_TIMEOUT
+    );
+
+  // --------------------------------------------------------
+  // If token/server authorization changed, refresh resolver
+  // once. We cannot regenerate an already expired segment,
+  // but this fixes origins where headers themselves changed.
+  // --------------------------------------------------------
+
+  if (
+    upstream.status === 401 ||
+    upstream.status === 403
+  ) {
+    try {
+      info =
+        await resolveChannel(
+          channelId,
+          serverIndex,
+          true
+        );
+
+      const retryHeaders =
+        buildUpstreamHeaders(
+          info,
+          targetUrl,
+          request
+        );
+
+      upstream =
+        await fetchTimeout(
+          targetUrl,
+          {
+            method:
+              request.method === "HEAD"
+                ? "HEAD"
+                : "GET",
+
+            headers:
+              retryHeaders,
+
+            redirect:
+              "follow",
+
+            cf: {
+              cacheTtl: 0,
+            },
+          },
+
+          CONFIG.RESOURCE_TIMEOUT
+        );
+
+    } catch {
+      // Continue with original response.
+    }
+  }
+
+  if (!upstream.ok) {
+    return new Response(
+      `Upstream HTTP ${upstream.status}`,
+      {
+        status:
+          upstream.status >= 400 &&
+          upstream.status <= 599
+            ? upstream.status
+            : 502,
+
+        headers: {
+          "Content-Type":
+            "text/plain",
+
+          "Access-Control-Allow-Origin":
+            "*",
+
+          "Cache-Control":
+            "no-store",
+        },
+      }
+    );
+  }
+
+  const contentType =
+    upstream.headers.get(
+      "Content-Type"
+    ) || "";
+
+  // --------------------------------------------------------
+  // Nested HLS playlist
+  // --------------------------------------------------------
+
+  const finalPath =
+    (() => {
+      try {
+        return new URL(
+          upstream.url
+        ).pathname.toLowerCase();
+      } catch {
+        return "";
+      }
+    })();
+
+  if (
+    contentType
+      .toLowerCase()
+      .includes("mpegurl") ||
+    finalPath.endsWith(".m3u8") ||
+    finalPath.endsWith(".m3u")
+  ) {
+    const body =
+      await upstream.text();
+
+    if (
+      body
+        .trimStart()
+        .startsWith("#EXTM3U")
+    ) {
+      const origin =
+        new URL(request.url).origin;
+
+      const rewritten =
+        rewriteHls(
+          body,
+          upstream.url,
+          origin,
+          channelId,
+          serverIndex,
+          info.swap || {}
+        );
+
+      return new Response(
+        rewritten,
+        {
+          headers: {
+            "Content-Type":
+              "application/vnd.apple.mpegurl; charset=utf-8",
+
+            "Access-Control-Allow-Origin":
+              "*",
+
+            "Cache-Control":
+              "no-store, no-cache, must-revalidate",
+          },
+        }
+      );
+    }
+  }
+
+  // --------------------------------------------------------
+  // Raw streamed segment/key/init file
+  // --------------------------------------------------------
+
+  const responseHeaders =
+    new Headers();
+
+  const passHeaders = [
+    "Content-Type",
+    "Content-Length",
+    "Content-Range",
+    "Accept-Ranges",
+    "ETag",
+    "Last-Modified",
+  ];
+
+  for (
+    const header
+    of passHeaders
+  ) {
+    const value =
+      upstream.headers.get(
+        header
+      );
+
+    if (value) {
+      responseHeaders.set(
+        header,
+        value
+      );
+    }
+  }
+
+  // Some providers deliberately disguise TS as .js/.pdf.
+  if (
+    finalPath.endsWith(".ts") ||
+    finalPath.endsWith(".js") ||
+    finalPath.endsWith(".pdf")
+  ) {
+    const current =
+      responseHeaders.get(
+        "Content-Type"
+      );
+
+    if (
+      !current ||
+      current.includes("javascript") ||
+      current.includes("pdf") ||
+      current.includes("text/")
+    ) {
+      responseHeaders.set(
+        "Content-Type",
+        "video/mp2t"
+      );
+    }
+  }
+
+  if (
+    finalPath.endsWith(".m4s")
+  ) {
+    responseHeaders.set(
+      "Content-Type",
+      "video/iso.segment"
+    );
+  }
+
+  if (
+    finalPath.endsWith(".mp4") &&
+    !responseHeaders.has(
+      "Content-Type"
+    )
+  ) {
+    responseHeaders.set(
+      "Content-Type",
+      "video/mp4"
+    );
+  }
+
+  responseHeaders.set(
     "Access-Control-Allow-Origin",
-    CONFIG.CORS
+    "*"
   );
 
-  headers.set(
-    "Access-Control-Allow-Methods",
-    "GET, HEAD, OPTIONS"
-  );
-
-  headers.set(
+  responseHeaders.set(
     "Access-Control-Allow-Headers",
-    "Range, Accept, Content-Type"
+    "*"
   );
 
-  headers.set(
+  responseHeaders.set(
     "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges, " +
-      "X-YCN-Version, X-YCN-Profile, X-YCN-Sequence, " +
-      "X-YCN-Cache, X-YCN-Original-Type, X-YCN-Segment-Type"
+    "Content-Length,Content-Range,Accept-Ranges"
+  );
+
+  responseHeaders.set(
+    "Cache-Control",
+    "public, max-age=1"
   );
 
   return new Response(
-    response.body,
+    upstream.body,
     {
       status:
-        response.status,
+        upstream.status,
 
-      statusText:
-        response.statusText,
-
-      headers,
+      headers:
+        responseHeaders,
     }
   );
 }
+
+
+// ============================================================
+// BROWSER PLAYER
+// ============================================================
+
+function playerPage(
+  channelId,
+  server
+) {
+  const id =
+    JSON.stringify(
+      String(channelId)
+    );
+
+  const srv =
+    Number(server) || 0;
+
+  return `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1,viewport-fit=cover"
+/>
+
+<meta
+  name="theme-color"
+  content="#000000"
+/>
+
+<title>Drama Live</title>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+
+<style>
+*{
+ box-sizing:border-box;
+}
+
+html,
+body{
+ margin:0;
+ width:100%;
+ height:100%;
+ background:#000;
+ color:#fff;
+ font-family:
+ -apple-system,
+ BlinkMacSystemFont,
+ "SF Pro Display",
+ "Segoe UI",
+ sans-serif;
+}
+
+body{
+ overflow:hidden;
+}
+
+#wrap{
+ position:fixed;
+ inset:0;
+ background:#000;
+ display:flex;
+ align-items:center;
+ justify-content:center;
+}
+
+video{
+ width:100%;
+ height:100%;
+ background:#000;
+ object-fit:contain;
+}
+
+.top{
+ position:absolute;
+ z-index:5;
+ top:0;
+ left:0;
+ right:0;
+ padding:
+ max(16px,env(safe-area-inset-top))
+ 16px
+ 40px;
+ background:
+ linear-gradient(
+   rgba(0,0,0,.8),
+   transparent
+ );
+ pointer-events:none;
+}
+
+.title{
+ font-weight:800;
+ font-size:18px;
+}
+
+.status{
+ margin-top:5px;
+ color:#bbb;
+ font-size:12px;
+}
+
+.live{
+ color:#ff334f;
+ font-weight:800;
+}
+
+.center{
+ position:absolute;
+ z-index:6;
+ left:50%;
+ top:50%;
+ transform:
+ translate(-50%,-50%);
+ text-align:center;
+ display:none;
+ background:
+ rgba(15,15,15,.92);
+ border:
+ 1px solid #333;
+ padding:18px;
+ border-radius:18px;
+ width:min(90%,350px);
+}
+
+button{
+ background:#fff;
+ color:#000;
+ border:0;
+ border-radius:100px;
+ padding:11px 18px;
+ font-weight:800;
+ margin-top:12px;
+}
+
+.spinner{
+ width:40px;
+ height:40px;
+ border:
+ 3px solid rgba(255,255,255,.18);
+ border-top-color:#fff;
+ border-radius:50%;
+ animation:
+ spin .75s linear infinite;
+ position:absolute;
+ z-index:4;
+}
+
+@keyframes spin{
+ to{
+   transform:rotate(360deg);
+ }
+}
+</style>
+</head>
+
+<body>
+
+<div id="wrap">
+
+<video
+ id="video"
+ controls
+ autoplay
+ playsinline
+ webkit-playsinline
+></video>
+
+<div class="top">
+
+<div class="title">
+Drama Live
+</div>
+
+<div class="status">
+
+<span class="live">
+● LIVE
+</span>
+
+&nbsp;
+
+<span id="status">
+جاري الاتصال...
+</span>
+
+</div>
+
+</div>
+
+<div
+ id="spinner"
+ class="spinner"
+></div>
+
+<div
+ id="error"
+ class="center"
+>
+
+<div id="errorText">
+تعذر تشغيل البث
+</div>
+
+<button onclick="start(true)">
+إعادة المحاولة
+</button>
+
+</div>
+
+</div>
+
+<script>
+const CHANNEL=${id};
+const SERVER=${srv};
+
+const video=
+ document.getElementById("video");
+
+const statusText=
+ document.getElementById("status");
+
+const spinner=
+ document.getElementById("spinner");
+
+const errorBox=
+ document.getElementById("error");
+
+const errorText=
+ document.getElementById("errorText");
+
+let hls=null;
+
+function source(force=false){
+ let u=
+   "/live/" +
+   encodeURIComponent(CHANNEL) +
+   ".m3u8?server=" +
+   SERVER;
+
+ if(force){
+   u+="&force=1&_="+Date.now();
+ }else{
+   u+="&_="+Date.now();
+ }
+
+ return u;
+}
+
+function loading(v){
+ spinner.style.display=
+   v ? "block" : "none";
+}
+
+function destroy(){
+ if(hls){
+   try{
+     hls.destroy();
+   }catch(e){}
+   hls=null;
+ }
+}
+
+function showError(text){
+ loading(false);
+
+ errorText.textContent=
+   text || "تعذر تشغيل البث";
+
+ errorBox.style.display=
+   "block";
+}
+
+function start(force=false){
+ destroy();
+
+ errorBox.style.display=
+   "none";
+
+ loading(true);
+
+ statusText.textContent=
+   "جاري الاتصال...";
+
+ const src=source(force);
+
+ if(
+   window.Hls &&
+   Hls.isSupported()
+ ){
+   hls=new Hls({
+     enableWorker:true,
+
+     lowLatencyMode:true,
+
+     backBufferLength:30,
+
+     liveSyncDurationCount:3,
+
+     liveMaxLatencyDurationCount:8,
+
+     maxBufferLength:20,
+
+     maxMaxBufferLength:40,
+
+     manifestLoadingTimeOut:12000,
+
+     levelLoadingTimeOut:12000,
+
+     fragLoadingTimeOut:18000,
+
+     manifestLoadingMaxRetry:4,
+
+     levelLoadingMaxRetry:6,
+
+     fragLoadingMaxRetry:6,
+
+     fragLoadingRetryDelay:500,
+
+     levelLoadingRetryDelay:500
+   });
+
+   hls.attachMedia(video);
+
+   hls.on(
+     Hls.Events.MEDIA_ATTACHED,
+     ()=>{
+       hls.loadSource(src);
+     }
+   );
+
+   hls.on(
+     Hls.Events.MANIFEST_PARSED,
+     ()=>{
+       loading(false);
+
+       statusText.textContent=
+         "متصل";
+
+       video.play().catch(()=>{});
+     }
+   );
+
+   hls.on(
+     Hls.Events.ERROR,
+     (event,data)=>{
+       console.log(
+         "HLS",
+         data
+       );
+
+       if(!data.fatal){
+         return;
+       }
+
+       if(
+         data.type ===
+         Hls.ErrorTypes.MEDIA_ERROR
+       ){
+         try{
+           hls.recoverMediaError();
+           return;
+         }catch(e){}
+       }
+
+       if(
+         data.type ===
+         Hls.ErrorTypes.NETWORK_ERROR
+       ){
+         try{
+           hls.startLoad();
+           return;
+         }catch(e){}
+       }
+
+       showError(
+         data.details ||
+         "خطأ في البث"
+       );
+     }
+   );
+
+ }else if(
+   video.canPlayType(
+     "application/vnd.apple.mpegurl"
+   )
+ ){
+   video.src=src;
+
+   video.addEventListener(
+     "loadedmetadata",
+     ()=>{
+       loading(false);
+
+       statusText.textContent=
+         "متصل";
+
+       video.play().catch(()=>{});
+     },
+     {
+       once:true
+     }
+   );
+
+ }else{
+   showError(
+     "هذا المتصفح لا يدعم HLS"
+   );
+ }
+}
+
+video.addEventListener(
+ "playing",
+ ()=>{
+   loading(false);
+   statusText.textContent="متصل";
+ }
+);
+
+video.addEventListener(
+ "waiting",
+ ()=>{
+   loading(true);
+   statusText.textContent="جاري التحميل...";
+ }
+);
+
+start(false);
+</script>
+
+</body>
+</html>`;
+}
+
+
+// ============================================================
+// API HOME PAGE
+// ============================================================
+
+function homePage(origin) {
+  return `<!doctype html>
+<html lang="ar" dir="rtl">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+ name="viewport"
+ content="width=device-width,initial-scale=1"
+/>
+
+<title>Drama Live API</title>
+
+<style>
+:root{
+ color-scheme:dark;
+}
+
+*{
+ box-sizing:border-box;
+}
+
+body{
+ margin:0;
+ background:#0b0b0c;
+ color:#fff;
+ font-family:
+ -apple-system,
+ BlinkMacSystemFont,
+ "SF Pro Display",
+ "Segoe UI",
+ sans-serif;
+}
+
+main{
+ width:min(900px,calc(100% - 28px));
+ margin:auto;
+ padding:50px 0 100px;
+}
+
+.logo{
+ display:flex;
+ align-items:center;
+ gap:12px;
+ margin-bottom:30px;
+}
+
+.icon{
+ width:48px;
+ height:36px;
+ border-radius:11px;
+ background:#ff0033;
+ display:grid;
+ place-items:center;
+ font-size:20px;
+}
+
+h1{
+ margin:0;
+ font-size:27px;
+}
+
+.sub{
+ color:#aaa;
+ margin-top:5px;
+}
+
+.card{
+ margin-top:16px;
+ border:1px solid #252527;
+ background:#141416;
+ border-radius:18px;
+ padding:18px;
+}
+
+.badge{
+ display:inline-block;
+ color:#8fffa8;
+ background:#0d2b16;
+ border:1px solid #185928;
+ border-radius:100px;
+ padding:5px 10px;
+ font-size:12px;
+ margin-bottom:13px;
+}
+
+code{
+ direction:ltr;
+ display:block;
+ background:#09090a;
+ border:1px solid #262629;
+ border-radius:10px;
+ padding:12px;
+ overflow:auto;
+ color:#d9d9de;
+ margin-top:8px;
+}
+
+a{
+ color:#fff;
+}
+</style>
+
+</head>
+
+<body>
+
+<main>
+
+<div class="logo">
+
+<div class="icon">
+▶
+</div>
+
+<div>
+
+<h1>
+Drama Live Gateway
+</h1>
+
+<div class="sub">
+Cloudflare Streaming API
+</div>
+
+</div>
+
+</div>
+
+<div class="card">
+
+<div class="badge">
+● API ONLINE
+</div>
+
+<div>
+التصنيفات
+</div>
+
+<code>
+GET ${origin}/api/topics
+</code>
+
+</div>
+
+<div class="card">
+
+<div>
+قنوات التصنيف
+</div>
+
+<code>
+GET ${origin}/api/channels/{topic}
+</code>
+
+</div>
+
+<div class="card">
+
+<div>
+سيرفرات القناة
+</div>
+
+<code>
+GET ${origin}/api/servers/{channel_id}
+</code>
+
+</div>
+
+<div class="card">
+
+<div>
+رابط HLS مباشر
+</div>
+
+<code>
+${origin}/live/{channel_id}.m3u8
+</code>
+
+<code>
+${origin}/live/{channel_id}.m3u8?server=1
+</code>
+
+</div>
+
+<div class="card">
+
+<div>
+مشغل المتصفح
+</div>
+
+<code>
+${origin}/watch/{channel_id}
+</code>
+
+<code>
+${origin}/watch/{channel_id}?server=1
+</code>
+
+</div>
+
+</main>
+
+</body>
+</html>`;
+}
+
+
+// ============================================================
+// ROUTER
+// ============================================================
+
+export default {
+
+  async fetch(
+    request,
+    env,
+    ctx
+  ) {
+    try {
+      if (
+        request.method === "OPTIONS"
+      ) {
+        return new Response(
+          null,
+          {
+            status: 204,
+
+            headers: {
+              "Access-Control-Allow-Origin":
+                "*",
+
+              "Access-Control-Allow-Headers":
+                "*",
+
+              "Access-Control-Allow-Methods":
+                "GET,HEAD,POST,OPTIONS",
+
+              "Access-Control-Max-Age":
+                "86400",
+            },
+          }
+        );
+      }
+
+      const url =
+        new URL(request.url);
+
+      const path =
+        url.pathname;
+
+      // ------------------------------------------------------
+      // HOME
+      // ------------------------------------------------------
+
+      if (
+        path === "/" ||
+        path === ""
+      ) {
+        return new Response(
+          homePage(url.origin),
+          {
+            headers: {
+              "Content-Type":
+                "text/html; charset=utf-8",
+
+              "Cache-Control":
+                "no-store",
+            },
+          }
+        );
+      }
+
+      // ------------------------------------------------------
+      // HEALTH
+      // ------------------------------------------------------
+
+      if (
+        path === "/health"
+      ) {
+        return jsonResponse({
+          ok: true,
+
+          service:
+            "Drama Live Gateway",
+
+          time:
+            new Date().toISOString(),
+        });
+      }
+
+      // ------------------------------------------------------
+      // TOPICS
+      // ------------------------------------------------------
+
+      if (
+        path === "/api/topics"
+      ) {
+        return await routeTopics(
+          url
+        );
+      }
+
+      // ------------------------------------------------------
+      // CHANNELS
+      // ------------------------------------------------------
+
+      let match =
+        path.match(
+          /^\/api\/channels\/(.+)$/
+        );
+
+      if (match) {
+        const topic =
+          decodeURIComponent(
+            match[1]
+          );
+
+        return await routeChannels(
+          topic,
+          url
+        );
+      }
+
+      // ------------------------------------------------------
+      // SERVERS
+      // ------------------------------------------------------
+
+      match =
+        path.match(
+          /^\/api\/servers\/([^/]+)$/
+        );
+
+      if (match) {
+        const channelId =
+          decodeURIComponent(
+            match[1]
+          );
+
+        return await routeServers(
+          channelId
+        );
+      }
+
+      // ------------------------------------------------------
+      // RESOLVE
+      // ------------------------------------------------------
+
+      match =
+        path.match(
+          /^\/api\/resolve\/([^/]+)$/
+        );
+
+      if (match) {
+        const channelId =
+          decodeURIComponent(
+            match[1]
+          );
+
+        return await routeResolve(
+          channelId,
+          url
+        );
+      }
+
+      // ------------------------------------------------------
+      // WATCH
+      // ------------------------------------------------------
+
+      match =
+        path.match(
+          /^\/watch\/([^/]+)$/
+        );
+
+      if (match) {
+        const channelId =
+          decodeURIComponent(
+            match[1]
+          );
+
+        const server =
+          url.searchParams.get(
+            "server"
+          ) || "0";
+
+        return new Response(
+          playerPage(
+            channelId,
+            server
+          ),
+          {
+            headers: {
+              "Content-Type":
+                "text/html; charset=utf-8",
+
+              "Cache-Control":
+                "no-store",
+            },
+          }
+        );
+      }
+
+      // ------------------------------------------------------
+      // LIVE
+      // ------------------------------------------------------
+
+      match =
+        path.match(
+          /^\/live\/(.+?)\.m3u8$/
+        );
+
+      if (match) {
+        const channelId =
+          decodeURIComponent(
+            match[1]
+          );
+
+        return await routeLive(
+          request,
+          url,
+          channelId
+        );
+      }
+
+      // ------------------------------------------------------
+      // RESOURCE
+      // ------------------------------------------------------
+
+      match =
+        path.match(
+          /^\/r\/([^/]+)\/(\d+)\/([^/]+)$/
+        );
+
+      if (match) {
+        const channelId =
+          decodeURIComponent(
+            match[1]
+          );
+
+        const serverIndex =
+          Number.parseInt(
+            match[2],
+            10
+          );
+
+        const token =
+          match[3];
+
+        return await routeResource(
+          request,
+          channelId,
+          serverIndex,
+          token
+        );
+      }
+
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            "Route not found",
+        },
+        404
+      );
+
+    } catch (error) {
+      console.error(
+        "WORKER ERROR",
+        error
+      );
+
+      return errorResponse(
+        error,
+        502
+      );
+    }
+  },
+};
