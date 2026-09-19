@@ -1,45 +1,30 @@
 /**
- * Enlil Redline Gateway
- * Cloudflare Worker
- *
- * Routes:
- *   /live/<channel>.m3u8
- *   /health
- *
- * Example:
- *   /live/bein1.m3u8
+ * Enlil Redline Worker - Diagnostic Version
  */
 
-const REDLINE_BASE =
-  "http://play.redroidiptv.com/live/hls/20/US";
+const REDLINE_BASE = "http://play.redroidiptv.com/live/hls/20/US";
 
 const DEVICE_MAC = "02:00:00:00:00:00";
 const DEVICE_CODE = "RDLNB89BED0248FA";
 const XOR_KEY = "KCQ";
-
 const REDLINE_UA = "Rediptv 2.0.74";
 
-/*
- * ضع هنا أسماء القنوات كما يعرفها Redline.
- * سيتم تحويلها إلى HEX تلقائياً.
- */
 const CHANNELS = {
   bein1: "Plus/beIN_Sports1_HD-ar",
 
-  // أمثلة لإضافة المزيد:
+  // أضف القنوات لاحقاً:
   // bein2: "Plus/beIN_Sports2_HD-ar",
   // bein3: "Plus/beIN_Sports3_HD-ar",
 };
 
 
 // ============================================================
-// Utilities
+// Encoding
 // ============================================================
 
 function utf8Bytes(text) {
   return new TextEncoder().encode(text);
 }
-
 
 function bytesToBase64(bytes) {
   let binary = "";
@@ -51,12 +36,11 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-
 function stringToHex(text) {
   const bytes = utf8Bytes(text);
 
   return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, "0"))
+    .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
@@ -65,24 +49,18 @@ function stringToHex(text) {
 // R-Auth
 // ============================================================
 
-function generateRAuth() {
-
-  const timestamp = Math.floor(Date.now() / 1000);
-
-  /*
-   * DEVICE_MAC
-   * + 0x02 0x7C
-   * + DEVICE_CODE
-   * + 0x02 0x7C
-   * + timestamp
-   */
+function generateRAuth(timestamp = null) {
+  const ts =
+    timestamp !== null
+      ? Number(timestamp)
+      : Math.floor(Date.now() / 1000);
 
   const raw =
     DEVICE_MAC +
     "\x02|" +
     DEVICE_CODE +
     "\x02|" +
-    timestamp;
+    String(ts);
 
   const input = utf8Bytes(raw);
   const key = utf8Bytes(XOR_KEY);
@@ -101,50 +79,255 @@ function generateRAuth() {
 // Redline headers
 // ============================================================
 
-function redlineHeaders() {
-
+function createRedlineHeaders(rAuth = null) {
   return {
     "User-Agent": REDLINE_UA,
-    "R-Auth": generateRAuth(),
-
+    "R-Auth": rAuth || generateRAuth(),
     "Accept": "*/*",
-    "Accept-Encoding": "identity"
+    "Accept-Encoding": "identity",
   };
 }
 
 
 // ============================================================
-// Resolve Redline channel
+// CORS
 // ============================================================
 
-async function resolveRedline(channelName) {
+function corsHeaders(extra = {}) {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    ...extra,
+  };
+}
 
+
+// ============================================================
+// JSON response
+// ============================================================
+
+function json(data, status = 200) {
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: corsHeaders({
+        "Content-Type": "application/json; charset=UTF-8",
+        "Cache-Control": "no-store",
+      }),
+    }
+  );
+}
+
+
+// ============================================================
+// Channel URL
+// ============================================================
+
+function getChannelSource(channelName) {
   const streamName = CHANNELS[channelName];
 
   if (!streamName) {
-    throw new Error("Unknown channel");
+    throw new Error(`Unknown channel: ${channelName}`);
   }
 
   const channelHex = stringToHex(streamName);
 
-  const sourceURL =
-    `${REDLINE_BASE}/${channelHex}/1`;
+  return {
+    streamName,
+    channelHex,
+    sourceURL:
+      `${REDLINE_BASE}/${channelHex}/1`,
+  };
+}
 
-  const response = await fetch(sourceURL, {
-    method: "GET",
 
-    headers: redlineHeaders(),
+// ============================================================
+// DEBUG
+//
+// مهم:
+// لا يتبع Redirect.
+//
+// الهدف معرفة:
+// Redline -> 302 ؟
+// أم Redline -> 403 ؟
+// ============================================================
 
-    redirect: "follow"
-  });
+async function debugRedline(channelName) {
+  const channel = getChannelSource(channelName);
 
-  if (!response.ok) {
-    throw new Error(
-      `Redline HTTP ${response.status}`
+  const timestamp =
+    Math.floor(Date.now() / 1000);
+
+  const rAuth =
+    generateRAuth(timestamp);
+
+  let response;
+
+  try {
+    response = await fetch(
+      channel.sourceURL,
+      {
+        method: "GET",
+
+        headers: createRedlineHeaders(rAuth),
+
+        redirect: "manual",
+      }
+    );
+  } catch (error) {
+    return json(
+      {
+        ok: false,
+        stage: "initial_fetch",
+
+        error:
+          error?.message || String(error),
+
+        channel: channelName,
+
+        sourceURL:
+          channel.sourceURL,
+
+        timestamp,
+      },
+      502
     );
   }
 
-  const playlist = await response.text();
+  let body = "";
+
+  try {
+    body = await response.text();
+  } catch (_) {
+    body = "";
+  }
+
+  const interestingHeaders = {};
+
+  const names = [
+    "location",
+    "server",
+    "content-type",
+    "content-length",
+    "date",
+    "via",
+    "cf-ray",
+    "cf-cache-status",
+  ];
+
+  for (const name of names) {
+    const value =
+      response.headers.get(name);
+
+    if (value !== null) {
+      interestingHeaders[name] = value;
+    }
+  }
+
+  return json({
+    ok:
+      response.status >= 200 &&
+      response.status < 400,
+
+    stage: "initial_redline_request",
+
+    channel: channelName,
+
+    streamName:
+      channel.streamName,
+
+    channelHex:
+      channel.channelHex,
+
+    sourceURL:
+      channel.sourceURL,
+
+    timestamp,
+
+    authGenerated: true,
+
+    requestHeaders: {
+      "User-Agent": REDLINE_UA,
+      "R-Auth": "[generated]",
+      "Accept": "*/*",
+      "Accept-Encoding": "identity",
+    },
+
+    response: {
+      status: response.status,
+
+      statusText:
+        response.statusText,
+
+      url:
+        response.url,
+
+      redirected:
+        response.redirected,
+
+      location:
+        response.headers.get("location"),
+
+      headers:
+        interestingHeaders,
+
+      bodyPreview:
+        body.substring(0, 1500),
+    },
+
+    interpretation:
+      response.status >= 300 &&
+      response.status < 400
+        ? "Initial authentication appears accepted and Redline returned a redirect."
+        : response.status === 401 ||
+          response.status === 403
+        ? "Initial Redline endpoint rejected the Worker request."
+        : response.status === 200
+        ? "Initial endpoint returned HTTP 200 directly."
+        : "Unexpected upstream response.",
+  });
+}
+
+
+// ============================================================
+// Resolve Redline
+// ============================================================
+
+async function resolveRedline(channelName) {
+  const channel =
+    getChannelSource(channelName);
+
+  const response = await fetch(
+    channel.sourceURL,
+    {
+      method: "GET",
+
+      headers:
+        createRedlineHeaders(),
+
+      redirect: "follow",
+    }
+  );
+
+  if (!response.ok) {
+    let preview = "";
+
+    try {
+      preview =
+        (await response.text())
+          .substring(0, 500);
+    } catch (_) {}
+
+    throw new Error(
+      `Redline HTTP ${response.status}` +
+      (preview ? `: ${preview}` : "")
+    );
+  }
+
+  const playlist =
+    await response.text();
 
   if (!playlist.includes("#EXTM3U")) {
     throw new Error(
@@ -152,26 +335,18 @@ async function resolveRedline(channelName) {
     );
   }
 
-  /*
-   * response.url = final redirected URL
-   *
-   * مهم جداً لأن الروابط النسبية داخل
-   * الـMaster يجب حلها بالنسبة لهذا العنوان.
-   */
-
   return {
     playlist,
-    finalURL: response.url
+    finalURL: response.url,
   };
 }
 
 
 // ============================================================
-// HLS URL resolution
+// URL resolver
 // ============================================================
 
 function absoluteURL(uri, base) {
-
   try {
     return new URL(uri, base).toString();
   } catch {
@@ -181,7 +356,7 @@ function absoluteURL(uri, base) {
 
 
 // ============================================================
-// Rewrite Master Playlist
+// Rewrite HLS
 // ============================================================
 
 function rewritePlaylist(
@@ -189,73 +364,58 @@ function rewritePlaylist(
   finalURL,
   workerOrigin
 ) {
-
-  const lines = playlist.split(/\r?\n/);
+  const lines =
+    playlist.split(/\r?\n/);
 
   const output = [];
 
   for (let line of lines) {
-
-    const trimmed = line.trim();
+    const trimmed =
+      line.trim();
 
     if (!trimmed) {
       output.push(line);
       continue;
     }
 
-    /*
-     * HLS directives
-     */
+    // -----------------------------------------
+    // HLS directive
+    // -----------------------------------------
 
     if (trimmed.startsWith("#")) {
-
-      /*
-       * URI="..."
-       *
-       * Covers:
-       *
-       * EXT-X-KEY
-       * EXT-X-MAP
-       * EXT-X-MEDIA
-       */
-
       line = line.replace(
         /URI="([^"]+)"/g,
         (_, uri) => {
-
           const absolute =
-            absoluteURL(uri, finalURL);
+            absoluteURL(
+              uri,
+              finalURL
+            );
 
-          const proxy =
-            workerOrigin +
-            "/resource?url=" +
-            encodeURIComponent(absolute);
-
-          return `URI="${proxy}"`;
+          return (
+            `URI="${workerOrigin}` +
+            `/resource?url=` +
+            `${encodeURIComponent(absolute)}"`
+          );
         }
       );
 
       output.push(line);
-
       continue;
     }
 
-    /*
-     * Normal URI line.
-     *
-     * Could be:
-     *
-     * variant playlist
-     * segment
-     * audio playlist
-     */
+    // -----------------------------------------
+    // Normal playlist URI
+    // -----------------------------------------
 
     const absolute =
-      absoluteURL(trimmed, finalURL);
+      absoluteURL(
+        trimmed,
+        finalURL
+      );
 
     output.push(
-      workerOrigin +
-      "/resource?url=" +
+      `${workerOrigin}/resource?url=` +
       encodeURIComponent(absolute)
     );
   }
@@ -269,104 +429,121 @@ function rewritePlaylist(
 // ============================================================
 
 async function proxyResource(requestURL) {
-
-  const encoded =
+  const targetString =
     requestURL.searchParams.get("url");
 
-  if (!encoded) {
-    return new Response(
-      "Missing url",
+  if (!targetString) {
+    return json(
       {
-        status: 400
-      }
+        ok: false,
+        error: "Missing url",
+      },
+      400
     );
   }
 
   let target;
 
   try {
-    target = new URL(encoded);
+    target =
+      new URL(targetString);
   } catch {
-    return new Response(
-      "Invalid URL",
+    return json(
       {
-        status: 400
-      }
+        ok: false,
+        error: "Invalid target URL",
+      },
+      400
     );
   }
-
-
-  /*
-   * منع استخدام الـWorker كبروكسي عام.
-   *
-   * يمكنك لاحقاً تشديد القائمة أكثر
-   * حسب نطاقات CDN الحقيقية.
-   */
 
   if (
     target.protocol !== "http:" &&
     target.protocol !== "https:"
   ) {
-    return new Response(
-      "Protocol not allowed",
+    return json(
       {
-        status: 403
-      }
+        ok: false,
+        error: "Protocol not allowed",
+      },
+      403
     );
   }
 
+  let upstream;
 
-  const headers = redlineHeaders();
+  try {
+    upstream = await fetch(
+      target.toString(),
+      {
+        method: "GET",
 
+        headers:
+          createRedlineHeaders(),
 
-  const upstream = await fetch(
-    target.toString(),
-    {
-      method: "GET",
+        redirect: "follow",
+      }
+    );
+  } catch (error) {
+    return json(
+      {
+        ok: false,
 
-      headers,
+        stage: "resource_fetch",
 
-      redirect: "follow"
-    }
-  );
-
+        error:
+          error?.message ||
+          String(error),
+      },
+      502
+    );
+  }
 
   if (!upstream.ok) {
-
-    return new Response(
-      `Upstream HTTP ${upstream.status}`,
+    return json(
       {
-        status: upstream.status
-      }
+        ok: false,
+
+        stage: "resource_fetch",
+
+        status:
+          upstream.status,
+
+        target:
+          target.toString(),
+      },
+      upstream.status
     );
   }
 
-
   const contentType =
-    upstream.headers.get("content-type") || "";
+    upstream.headers.get(
+      "content-type"
+    ) || "";
 
-
-  /*
-   * إذا كان المورد Playlist
-   * نعيد كتابة روابطه أيضاً.
-   */
+  // -----------------------------------------
+  // Nested HLS playlist
+  // -----------------------------------------
 
   if (
-    contentType.includes("mpegurl") ||
-    target.pathname.endsWith(".m3u8")
+    contentType
+      .toLowerCase()
+      .includes("mpegurl") ||
+    upstream.url
+      .toLowerCase()
+      .includes(".m3u8") ||
+    target.pathname
+      .toLowerCase()
+      .endsWith(".m3u8")
   ) {
-
-    const text =
+    const playlist =
       await upstream.text();
-
-    const workerOrigin =
-      requestURL.origin;
 
     const rewritten =
       rewritePlaylist(
-        text,
+        playlist,
         upstream.url,
-        workerOrigin
+        requestURL.origin
       );
 
     return new Response(
@@ -374,171 +551,213 @@ async function proxyResource(requestURL) {
       {
         status: 200,
 
-        headers: {
-          "Content-Type":
-            "application/vnd.apple.mpegurl",
+        headers:
+          corsHeaders({
+            "Content-Type":
+              "application/vnd.apple.mpegurl",
 
-          "Cache-Control":
-            "no-store",
-
-          "Access-Control-Allow-Origin":
-            "*"
-        }
+            "Cache-Control":
+              "no-store",
+          }),
       }
     );
   }
 
+  // -----------------------------------------
+  // Binary resource / segment / key
+  // -----------------------------------------
 
-  /*
-   * Segment / key / binary resource
-   */
-
-  const responseHeaders =
+  const headers =
     new Headers();
 
-  responseHeaders.set(
-    "Content-Type",
-    contentType ||
-    "application/octet-stream"
-  );
-
-  responseHeaders.set(
+  headers.set(
     "Access-Control-Allow-Origin",
     "*"
   );
 
-  responseHeaders.set(
+  headers.set(
     "Cache-Control",
     "no-store"
   );
 
+  if (contentType) {
+    headers.set(
+      "Content-Type",
+      contentType
+    );
+  }
 
   const contentLength =
-    upstream.headers.get("content-length");
+    upstream.headers.get(
+      "content-length"
+    );
 
   if (contentLength) {
-    responseHeaders.set(
+    headers.set(
       "Content-Length",
       contentLength
     );
   }
 
-
   return new Response(
     upstream.body,
     {
       status: upstream.status,
-      headers: responseHeaders
+      headers,
     }
   );
 }
 
 
 // ============================================================
-// Main Worker
+// Worker
 // ============================================================
 
 export default {
-
   async fetch(request) {
+    const url =
+      new URL(request.url);
+
+    const pathname =
+      url.pathname;
+
+    // -----------------------------------------
+    // OPTIONS
+    // -----------------------------------------
+
+    if (request.method === "OPTIONS") {
+      return new Response(
+        null,
+        {
+          status: 204,
+          headers: corsHeaders(),
+        }
+      );
+    }
 
     try {
 
-      const url =
-        new URL(request.url);
+      // =======================================
+      // Home
+      // =======================================
 
-      const pathname =
-        url.pathname;
-
-
-      // ------------------------------------------------------
-      // CORS
-      // ------------------------------------------------------
-
-      if (request.method === "OPTIONS") {
-
-        return new Response(
-          null,
-          {
-            status: 204,
-
-            headers: {
-              "Access-Control-Allow-Origin":
-                "*",
-
-              "Access-Control-Allow-Methods":
-                "GET,HEAD,OPTIONS",
-
-              "Access-Control-Allow-Headers":
-                "*"
-            }
-          }
-        );
-      }
-
-
-      // ------------------------------------------------------
-      // Health
-      // ------------------------------------------------------
-
-      if (pathname === "/health") {
-
-        return Response.json({
+      if (
+        pathname === "/" ||
+        pathname === ""
+      ) {
+        return json({
           ok: true,
-          service:
-            "Enlil Redline Gateway",
 
-          time:
-            new Date().toISOString()
+          service:
+            "Enlil Redline Worker",
+
+          version:
+            "diagnostic-2",
+
+          channels:
+            Object.keys(CHANNELS),
+
+          examples: {
+            health:
+              "/health",
+
+            debug:
+              "/debug/bein1",
+
+            live:
+              "/live/bein1.m3u8",
+          },
         });
       }
 
 
-      // ------------------------------------------------------
-      // Resource proxy
-      // ------------------------------------------------------
+      // =======================================
+      // Health
+      // =======================================
+
+      if (pathname === "/health") {
+        return json({
+          ok: true,
+
+          service:
+            "Enlil Redline Worker",
+
+          time:
+            new Date().toISOString(),
+        });
+      }
+
+
+      // =======================================
+      // DEBUG
+      // /debug/bein1
+      // =======================================
+
+      const debugMatch =
+        pathname.match(
+          /^\/debug\/([a-zA-Z0-9_-]+)$/
+        );
+
+      if (debugMatch) {
+        const channelName =
+          debugMatch[1];
+
+        if (!CHANNELS[channelName]) {
+          return json(
+            {
+              ok: false,
+              error:
+                "Channel not found",
+            },
+            404
+          );
+        }
+
+        return await debugRedline(
+          channelName
+        );
+      }
+
+
+      // =======================================
+      // Resource
+      // =======================================
 
       if (pathname === "/resource") {
-
         return await proxyResource(url);
       }
 
 
-      // ------------------------------------------------------
+      // =======================================
+      // LIVE
       // /live/bein1.m3u8
-      // ------------------------------------------------------
+      // =======================================
 
-      const match =
+      const liveMatch =
         pathname.match(
           /^\/live\/([a-zA-Z0-9_-]+)\.m3u8$/
         );
 
-
-      if (match) {
-
+      if (liveMatch) {
         const channelName =
-          match[1];
+          liveMatch[1];
 
         if (!CHANNELS[channelName]) {
-
-          return Response.json(
+          return json(
             {
               ok: false,
+
               error:
-                "Channel not found"
+                "Channel not found",
             },
-            {
-              status: 404
-            }
+            404
           );
         }
-
 
         const result =
           await resolveRedline(
             channelName
           );
-
 
         const rewritten =
           rewritePlaylist(
@@ -547,73 +766,51 @@ export default {
             url.origin
           );
 
-
         return new Response(
           rewritten,
           {
             status: 200,
 
-            headers: {
-              "Content-Type":
-                "application/vnd.apple.mpegurl",
+            headers:
+              corsHeaders({
+                "Content-Type":
+                  "application/vnd.apple.mpegurl",
 
-              "Access-Control-Allow-Origin":
-                "*",
-
-              "Cache-Control":
-                "no-store"
-            }
+                "Cache-Control":
+                  "no-store",
+              }),
           }
         );
       }
 
 
-      // ------------------------------------------------------
-      // Home
-      // ------------------------------------------------------
+      // =======================================
+      // 404
+      // =======================================
 
-      return Response.json({
-        ok: true,
-
-        service:
-          "Enlil Redline Gateway",
-
-        routes: {
-          health:
-            "/health",
-
-          stream:
-            "/live/<channel>.m3u8"
+      return json(
+        {
+          ok: false,
+          error: "Route not found",
         },
+        404
+      );
 
-        channels:
-          Object.keys(CHANNELS)
-      });
-
-    }
-
-    catch (error) {
-
-      return Response.json(
+    } catch (error) {
+      return json(
         {
           ok: false,
 
           error:
             error?.message ||
-            String(error)
+            String(error),
+
+          type:
+            error?.name ||
+            "Error",
         },
-        {
-          status: 502,
-
-          headers: {
-            "Access-Control-Allow-Origin":
-              "*",
-
-            "Cache-Control":
-              "no-store"
-          }
-        }
+        502
       );
     }
-  }
+  },
 };
